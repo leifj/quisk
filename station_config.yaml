@@ -53,7 +53,7 @@ profiles:
         fallback_hosts:
           - 10.0.0.230
         port: 80
-        timeout: 0.8
+        timeout: 2.0
 
     mqtt:
       user: null

@@ -59,7 +59,9 @@ station_host_map = {
       "10.0.0.230",
     ),
     "port": 80,
-    "timeout": 0.8,
+    # The controller sits on WiFi; keep enough headroom for a marginal RF
+    # link (responses over 1 s were observed on the bench).
+    "timeout": 2.0,
   },
 }
 
