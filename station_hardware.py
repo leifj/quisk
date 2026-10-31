@@ -321,6 +321,8 @@ class Hardware(BaseHardware):
     self.atu100_block_reason = None
     self.atu100_inhibit_bypassed = False
     self.atu100_last_error = None
+    self.atu100_saved_mode = None
+    self.atu100_mode_switched = False
     
     self.client = mqtt.Client()
     if self.mqtt_user and self.mqtt_pass:
@@ -721,6 +723,28 @@ class Hardware(BaseHardware):
       return True
     return False
 
+  def _Atu100KeyDown(self, down):
+    wx.CallAfter(QS.set_key_down, 1 if down else 0)
+
+  def _Atu100SetMode(self, mode):
+    """Switch the quisk mode on the GUI thread; returns {prior, now}."""
+    box = {}
+    done = threading.Event()
+
+    def _apply():
+      app = self.application
+      box['prior'] = getattr(app, 'mode', None)
+      try:
+        app.modeButns.SetLabel(mode, True)
+      except Exception as e:
+        print("ATU-100: mode switch to %s failed: %s" % (mode, e))
+      box['now'] = getattr(app, 'mode', None)
+      done.set()
+
+    wx.CallAfter(_apply)
+    done.wait(2.0)
+    return box if done.is_set() else None
+
   def _Atu100ApplyTxPower(self, pct):
     """Set the TX drive multiplier to pct% (GUI thread); returns prior values."""
     box = {}
@@ -795,9 +819,18 @@ class Hardware(BaseHardware):
         saved = self._Atu100ApplyTxPower(self.atu100_tune_power)
         if saved:
           self.atu100_saved_power = saved
+        # PTT alone generates no carrier in SSB/DGT modes (suppressed
+        # carrier): switch to CW so key-down produces a constant carrier,
+        # the same pattern as the quisk Spot button.
+        saved_mode = self._Atu100SetMode('CW')
+        if saved_mode and saved_mode.get('now') == 'CW':
+          self.atu100_saved_mode = saved_mode['prior']
+          self.atu100_mode_switched = True
+          time.sleep(0.5)      # mode/filter switch settle
         self._Atu100KeyCarrier(1)
         self.atu100_keyed = True
-        time.sleep(0.4)        # rig TX onset before the ATU samples RF
+        self._Atu100KeyDown(True)
+        time.sleep(0.3)        # carrier onset before the ATU samples RF
       if self._Atu100Request("/api/tune") is None:
         return False
       deadline = time.monotonic() + 12.0
@@ -826,14 +859,21 @@ class Hardware(BaseHardware):
       wx.CallAfter(setattr, self.application, 'tx_inhibit', True)
 
   def _Atu100ReleaseCarrier(self):
-    """Drop the tuning carrier and restore the normal TX drive."""
+    """Drop the tuning carrier and restore mode and TX drive."""
     if self.atu100_keyed:
+      self._Atu100KeyDown(False)
       self._Atu100KeyCarrier(0)
       self.atu100_keyed = False
       saved = self.atu100_saved_power
       self.atu100_saved_power = None
       if saved:
         self._Atu100RestoreTxPower(saved)
+    if self.atu100_mode_switched:
+      self.atu100_mode_switched = False
+      prior = self.atu100_saved_mode
+      self.atu100_saved_mode = None
+      if prior:
+        self._Atu100SetMode(prior)
 
   def Atu100Stop(self):
     """Release the tuning carrier if this module keyed it."""
