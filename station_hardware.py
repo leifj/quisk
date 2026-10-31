@@ -301,10 +301,13 @@ class Hardware(BaseHardware):
     self.atu100_last_tune_band = None
     self.atu100_tune_active = False
     self.atu100_keyed = False
+    self.atu100_saved_power = None
     # Key a tuning carrier from quisk after arming the ATU. Without RF the
     # ATU-100 tune() fails instantly and atu_reset() zeroes the network,
     # which looks like "TUNE then RESET" on the display.
     self.atu100_auto_key = bool(_yaml_profile.get("atu100_auto_key", True))
+    # TX drive multiplier (percent of normal) while the tune carrier is up.
+    self.atu100_tune_power = int(_yaml_profile.get("atu100_tune_power", 20))
     
     self.client = mqtt.Client()
     if self.mqtt_user and self.mqtt_pass:
@@ -700,6 +703,44 @@ class Hardware(BaseHardware):
       return True
     return False
 
+  def _Atu100ApplyTxPower(self, pct):
+    """Set the TX drive multiplier to pct% (GUI thread); returns prior values."""
+    box = {}
+    done = threading.Event()
+
+    def _apply():
+      app = self.application
+      box['tx'] = getattr(app, 'tx_level', 100)
+      box['dgt'] = getattr(app, 'digital_tx_level', None)
+      app.tx_level = pct
+      if box['dgt'] is not None:
+        app.digital_tx_level = pct
+      if hasattr(self, 'SetTxLevel'):
+        self.SetTxLevel()
+      done.set()
+
+    wx.CallAfter(_apply)
+    done.wait(2.0)
+    return box if done.is_set() else None
+
+  def _Atu100RestoreTxPower(self, saved):
+    if not saved:
+      return
+    done = threading.Event()
+
+    def _apply():
+      app = self.application
+      if 'tx' in saved:
+        app.tx_level = saved['tx']
+      if saved.get('dgt') is not None:
+        app.digital_tx_level = saved['dgt']
+      if hasattr(self, 'SetTxLevel'):
+        self.SetTxLevel()
+      done.set()
+
+    wx.CallAfter(_apply)
+    done.wait(2.0)
+
   def Atu100Tune(self, key_carrier=None):
     """Arm the ATU tune and key a tuning carrier until the cycle finishes.
 
@@ -720,6 +761,9 @@ class Hardware(BaseHardware):
         if not self._Atu100WaitTxInhibit(3.0):
           key_carrier = False
       if key_carrier:
+        saved = self._Atu100ApplyTxPower(self.atu100_tune_power)
+        if saved:
+          self.atu100_saved_power = saved
         self._Atu100KeyCarrier(1)
         self.atu100_keyed = True
         time.sleep(0.4)        # rig TX onset before the ATU samples RF
@@ -735,17 +779,24 @@ class Hardware(BaseHardware):
         if str(st.get("tuning", "")).lower() != "true":
           break
     finally:
-      if self.atu100_keyed:
-        self._Atu100KeyCarrier(0)
-        self.atu100_keyed = False
+      self._Atu100ReleaseCarrier()
       self.atu100_tune_active = False
     return True
+
+  def _Atu100ReleaseCarrier(self):
+    """Drop the tuning carrier and restore the normal TX drive."""
+    if self.atu100_keyed:
+      self._Atu100KeyCarrier(0)
+      self.atu100_keyed = False
+      saved = self.atu100_saved_power
+      self.atu100_saved_power = None
+      if saved:
+        self._Atu100RestoreTxPower(saved)
 
   def Atu100Stop(self):
     """Release the tuning carrier if this module keyed it."""
     if self.atu100_keyed:
-      self._Atu100KeyCarrier(0)
-      self.atu100_keyed = False
+      self._Atu100ReleaseCarrier()
       return True
     return False
 
