@@ -312,6 +312,12 @@ class Hardware(BaseHardware):
     _atu_cfg = _yaml_profile.get("atu100", {})
     self.atu100_auto_key = bool(_atu_cfg.get("auto_key", True))
     self.atu100_tune_power = int(_atu_cfg.get("tune_power", 50))
+    # Key the tune carrier even while quisk's amp-band TX inhibit is set
+    # (XPA125B offline or band not yet confirmed). The guard is cleared only
+    # for the duration of the tune carrier and restored afterwards.
+    self.atu100_ignore_inhibit = bool(_atu_cfg.get("ignore_inhibit", False))
+    self.atu100_block_reason = None
+    self.atu100_inhibit_bypassed = False
     
     self.client = mqtt.Client()
     if self.mqtt_user and self.mqtt_pass:
@@ -755,15 +761,28 @@ class Hardware(BaseHardware):
     if self.atu100_tune_active:
       return True
     self.atu100_tune_active = True
+    self.atu100_block_reason = None
     try:
       if not self._Atu100EnsurePower():
+        self.atu100_block_reason = "ATU unreachable"
+        wx.CallAfter(self._UpdateAtu100Label)
         return False
       if key_carrier is None:
         key_carrier = self.atu100_auto_key
       if key_carrier and not self._Atu100GetAppPtt():
-        # Respect the amplifier band guard; skip keying if it stays set.
-        if not self._Atu100WaitTxInhibit(3.0):
+        inhibited = bool(getattr(self.application, 'tx_inhibit', False))
+        if inhibited and self.atu100_ignore_inhibit:
+          # Temporarily lift the amp-band guard for the low-power tune
+          # carrier; restored in the finally block below.
+          self._Atu100BypassInhibit(True)
+        elif inhibited and not self._Atu100WaitTxInhibit(3.0):
+          # The amp band is not confirmed: quisk unkeys any PTT while the
+          # guard is set, so keying is pointless. Say so instead of failing
+          # silently.
           key_carrier = False
+          self.atu100_block_reason = "TX inhibit (amp band not confirmed)"
+          print("ATU-100: tune skipped, %s" % self.atu100_block_reason)
+          wx.CallAfter(self._UpdateAtu100Label)
       if key_carrier:
         saved = self._Atu100ApplyTxPower(self.atu100_tune_power)
         if saved:
@@ -783,9 +802,20 @@ class Hardware(BaseHardware):
         if str(st.get("tuning", "")).lower() != "true":
           break
     finally:
+      self._Atu100BypassInhibit(False)
       self._Atu100ReleaseCarrier()
       self.atu100_tune_active = False
     return True
+
+  def _Atu100BypassInhibit(self, bypass):
+    """Clear (and later restore) application.tx_inhibit for the tune carrier."""
+    if bypass and not self.atu100_inhibit_bypassed:
+      self.atu100_inhibit_bypassed = True
+      wx.CallAfter(setattr, self.application, 'tx_inhibit', False)
+      print("ATU-100: TX inhibit lifted for the tune carrier")
+    elif not bypass and self.atu100_inhibit_bypassed:
+      self.atu100_inhibit_bypassed = False
+      wx.CallAfter(setattr, self.application, 'tx_inhibit', True)
 
   def _Atu100ReleaseCarrier(self):
     """Drop the tuning carrier and restore the normal TX drive."""
@@ -817,6 +847,9 @@ class Hardware(BaseHardware):
     normal = self.conf.color_freq_txt
     green = wx.Colour(0, 200, 0)
     yellow = wx.Colour(220, 200, 0)
+    red = wx.Colour(220, 60, 60)
+    if self.atu100_block_reason:
+      return " ATU: %s " % self.atu100_block_reason, red
     if not self.atu100_connected:
       return " ATU: --- ", normal
     st = self.atu100_status

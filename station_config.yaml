@@ -90,6 +90,10 @@ profiles:
     atu100:
       auto_key:   true
       tune_power: 50
+      # Key the tune carrier even while the amp-band TX inhibit is set
+      # (XPA125B offline or band not confirmed). The guard is lifted only
+      # for the duration of the low-power tune carrier. Use with care.
+      # ignore_inhibit: false
 
     # ATR-1000 memory slot per band, keyed by switchctl antenna pin.
     # Outer key = pin number (int); inner key = Quisk band string; value = memory ID 1-255.
