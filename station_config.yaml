@@ -34,6 +34,10 @@ profiles:
         host: loopcontroller.local
         port: 80
         timeout: 0.35
+      esp32swr:
+        host: esp32swr.local
+        port: 80
+        timeout: 2.0
       switchctl:
         host: 10.0.0.229
         port: 80

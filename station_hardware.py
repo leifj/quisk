@@ -63,6 +63,12 @@ station_host_map = {
     # link (responses over 1 s were observed on the bench).
     "timeout": 2.0,
   },
+  "esp32swr": {
+    "host": "esp32swr.local",
+    "port": 80,
+    # WiFi link; same headroom as the atu100.
+    "timeout": 2.0,
+  },
 }
 
 # ATR-1000 memory slot per band, indexed by antenna switch pin.
@@ -109,6 +115,9 @@ atu100_host = station_host_map["atu100"]["host"]
 atu100_fallback_hosts = tuple(station_host_map["atu100"].get("fallback_hosts", ()))
 atu100_port = int(station_host_map["atu100"]["port"])
 atu100_timeout = float(station_host_map["atu100"]["timeout"])
+esp32swr_host = station_host_map["esp32swr"]["host"]
+esp32swr_port = int(station_host_map["esp32swr"]["port"])
+esp32swr_timeout = float(station_host_map["esp32swr"]["timeout"])
 xpa125b_relay_button_config = (
   {"label": "Power", "relay_index": 3, "short_press_ms": 2000, "long_press_ms": 1000, "power_button": True},
   {"label": "Relay 1", "relay_index": 0, "short_press_ms": 400, "long_press_ms": 1000},
@@ -233,6 +242,14 @@ class Hardware(BaseHardware):
     self.atu100_timeout = float(_atu_cfg.get("timeout", atu100_timeout))
     self.atu100_active_host = self.atu100_host
 
+    _espswr_cfg = _hosts.get("esp32swr", {})
+    self.esp32swr_host = _espswr_cfg.get("host", esp32swr_host)
+    _espswr_fb = _espswr_cfg.get("fallback_hosts", ())
+    self.esp32swr_fallback_hosts = tuple(_espswr_fb) if isinstance(_espswr_fb, (list, tuple)) else ()
+    self.esp32swr_port = int(_espswr_cfg.get("port", esp32swr_port))
+    self.esp32swr_timeout = float(_espswr_cfg.get("timeout", esp32swr_timeout))
+    self.esp32swr_active_host = self.esp32swr_host
+
     # --- XPA125B relay button config ---
     _relay_cfg = _yaml_profile.get("xpa125b_relays", None)
     if _relay_cfg and isinstance(_relay_cfg, list):
@@ -266,6 +283,9 @@ class Hardware(BaseHardware):
     self.swr_data = None
     self.last_swr_time = 0.0
     self.swr_stale_seconds = 1.5
+    self.esp32swr_connected = False
+    self.esp32swr_status = None
+    self.esp32swr_last_error = None
     self.lz1aq_power = None
     self.lz1aq_mode = None
     self.lz1aq_connected = False
@@ -336,7 +356,7 @@ class Hardware(BaseHardware):
       self.thread.daemon = True
       self.thread.start()
 
-    if 'lz1aq' in self.station_equipment or 'switchctl' in self.station_equipment or 'atu100' in self.station_equipment:
+    if 'lz1aq' in self.station_equipment or 'switchctl' in self.station_equipment or 'atu100' in self.station_equipment or 'esp32swr' in self.station_equipment:
       self.control_thread = threading.Thread(target=self.control_loop)
       self.control_thread.daemon = True
       self.control_thread.start()
@@ -378,6 +398,11 @@ class Hardware(BaseHardware):
       if 'atu100' in self.station_equipment:
         try:
           self.PollAtu100Status()
+        except Exception:
+          pass
+      if 'esp32swr' in self.station_equipment:
+        try:
+          self.PollEsp32SwrStatus()
         except Exception:
           pass
       time.sleep(self.control_poll_interval)
@@ -1212,6 +1237,71 @@ class Hardware(BaseHardware):
       threading.Thread(target=self.Atr1000ApplyMemory, args=(memory_id,), daemon=True).start()
     if 'atu100' in self.station_equipment:
       self._ScheduleAtu100Tune(band)
+
+  # --- esp32swr meter -------------------------------------------------------
+  # REST API: /api/status (fwd, rev, vswr, version, uptime, rssi, heap).
+  # The primary SWR feed is the MQTT topic esp32swr/raw; HTTP polling is the
+  # atu100-style path that also surfaces the meter state independently of
+  # the broker.
+
+  def _Esp32SwrRequest(self, endpoint, params=None):
+    hosts = []
+    if self.esp32swr_active_host:
+      hosts.append(self.esp32swr_active_host)
+    if self.esp32swr_host and self.esp32swr_host not in hosts:
+      hosts.append(self.esp32swr_host)
+    for host in self.esp32swr_fallback_hosts:
+      if host and host not in hosts:
+        hosts.append(host)
+
+    for host in hosts:
+      url = "http://%s:%d%s" % (host, self.esp32swr_port, endpoint)
+      if params:
+        url += "?" + urllib.parse.urlencode(params)
+      try:
+        with urllib.request.urlopen(url, timeout=self.esp32swr_timeout) as response:
+          payload = response.read().decode("utf-8", "ignore")
+        self.esp32swr_connected = True
+        self.esp32swr_active_host = host
+        self.esp32swr_last_error = None
+        try:
+          return json.loads(payload)
+        except Exception:
+          return payload
+      except Exception as e:
+        self.esp32swr_last_error = "%s: %s" % (type(e).__name__, e)
+        continue
+
+    self.esp32swr_connected = False
+    return None
+
+  def GetEsp32SwrConnected(self):
+    return self.esp32swr_connected
+
+  def GetEsp32SwrStatus(self):
+    return self.esp32swr_status
+
+  def PollEsp32SwrStatus(self):
+    response = self._Esp32SwrRequest("/api/status")
+    if isinstance(response, dict):
+      self.esp32swr_status = response
+      try:
+        fwd = float(response.get("fwd", "0"))
+      except Exception:
+        fwd = 0.0
+      if fwd > 0.001:
+        # Same semantics as the MQTT feed (esp32swr/raw): the reading only
+        # counts as valid while there is measurable forward power, so the
+        # label goes stale when the rig stops transmitting.
+        self.swr_data = {
+          "fwd": str(response.get("fwd", "0")),
+          "rev": str(response.get("rev", "0")),
+          "vswr": str(response.get("vswr", "1")),
+        }
+        self.last_swr_time = time.monotonic()
+        wx.CallAfter(self._UpdateSwrLabel)
+      return True
+    return False
 
   def check_tx_inhibit(self):
     # The amplifier band guard protects the XPA125B only while it is online:
