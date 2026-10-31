@@ -1,0 +1,118 @@
+# Station hardware configuration for Quisk
+#
+# Usage:
+#   export QUISK_STATION_PROFILES=/home/leifj/quisk/station_config.yaml
+#
+# In each Quisk radio config file set:
+#   station_profile = "<profile_name>"
+#
+# A profile that omits a section inherits the module-level Python defaults.
+# Only the keys you want to override need to be present.
+#
+# Equipment keys: mqtt, xpa125b, atr1000, lz1aq, switchctl, esp32swr, atu100
+
+profiles:
+
+  # -----------------------------------------------------------------------
+  # default: full station — all equipment active
+  # -----------------------------------------------------------------------
+  default:
+    equipment:
+      - mqtt
+      - xpa125b
+      - atr1000
+      - lz1aq
+      - switchctl
+      - esp32swr
+      - atu100
+
+    hosts:
+      mqtt:
+        host: ka10.mnt.se
+        port: 1883
+      lz1aq:
+        host: loopcontroller.local
+        port: 80
+        timeout: 0.35
+      switchctl:
+        host: 10.0.0.229
+        port: 80
+        timeout: 0.25
+      xpa125b:
+        host: xpa125b.local
+        fallback_hosts:
+          - 10.0.0.66
+        port: 80
+        timeout: 1.0
+      atr1000:
+        host: 10.0.0.180
+        port: 60001
+        timeout: 2.0
+      atu100:
+        host: atu100.local
+        fallback_hosts:
+          - 10.0.0.230
+        port: 80
+        timeout: 0.8
+
+    mqtt:
+      user: null
+      pass: null
+      topics:
+        setband: xpa125b/setband
+        status:  "xpa125b/#"
+        swr:     esp32swr/raw
+
+    xpa125b_relays:
+      - label:          Power
+        relay_index:    3
+        short_press_ms: 2000
+        long_press_ms:  1000
+        power_button:   true
+      - label:          Relay 1
+        relay_index:    0
+        short_press_ms: 400
+        long_press_ms:  1000
+      - label:          Relay 2
+        relay_index:    1
+        short_press_ms: 400
+        long_press_ms:  1000
+      - label:          Relay 3
+        relay_index:    2
+        short_press_ms: 400
+        long_press_ms:  1000
+
+    # ATR-1000 memory slot per band, keyed by switchctl antenna pin.
+    # Outer key = pin number (int); inner key = Quisk band string; value = memory ID 1-255.
+    atr1000_band_memory:
+      0:        # Pin 0: dipole / primary antenna
+        "10":  1   # 10m  -> M1
+        "12":  2   # 12m  -> M2
+        "15":  3   # 15m  -> M3
+        "17":  4   # 17m  -> M4
+        "20":  5   # 20m  -> M5
+        "30":  6   # 30m  -> M6
+        "40":  7   # 40m  -> M7
+        "80":  8   # 80m  -> M8
+        "160": 9   # 160m -> M9
+      1: {}     # Pin 1: vertical / secondary antenna
+      2: {}
+      3: {}
+
+  # -----------------------------------------------------------------------
+  # Example: second radio — MQTT band sync + SWR display only
+  # Uncomment and adjust to enable.
+  # -----------------------------------------------------------------------
+  # radio2:
+  #   equipment:
+  #     - mqtt
+  #     - esp32swr
+  #   hosts:
+  #     mqtt:
+  #       host: ka10.mnt.se
+  #       port: 1883
+  #   mqtt:
+  #     user: null
+  #     pass: null
+  #     topics:
+  #       swr: esp32swr/raw

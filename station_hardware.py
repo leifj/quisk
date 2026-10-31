@@ -1,0 +1,1165 @@
+# MQTT Hardware Module for Quisk
+# Integrates station hardware via MQTT (specifically for XPA125B)
+# Subclasses the Hermes hardware to maintain existing functionality.
+
+from __future__ import print_function
+from __future__ import absolute_import
+from __future__ import division
+
+import _quisk as QS
+from hermes.quisk_hardware import Hardware as BaseHardware
+import paho.mqtt.client as mqtt
+import threading
+import time
+import json
+import urllib.parse
+import urllib.request
+import wx
+import socket
+import os
+import base64
+import struct
+try:
+  import yaml as _yaml
+except ImportError:
+  _yaml = None
+
+# Override station endpoint mappings here.
+station_host_map = {
+  "mqtt": {
+    "host": "ka10.mnt.se",
+    "port": 1883,
+  },
+  "lz1aq": {
+    "host": "loopcontroller.local",
+    "port": 80,
+    "timeout": 0.35,
+  },
+  "switchctl": {
+    "host": "10.0.0.229",
+    "port": 80,
+    "timeout": 0.25,
+  },
+  "xpa125b": {
+    "host": "xpa125b.local",
+    "fallback_hosts": (
+      "10.0.0.66",
+    ),
+    "port": 80,
+    "timeout": 1.0,
+  },
+  "atr1000": {
+    "host": "10.0.0.180",
+    "port": 60001,
+    "timeout": 2.0,
+  },
+  "atu100": {
+    "host": "atu100.local",
+    "fallback_hosts": (
+      "10.0.0.230",
+    ),
+    "port": 80,
+    "timeout": 0.8,
+  },
+}
+
+# ATR-1000 memory slot per band, indexed by antenna switch pin.
+# Outer key = switchctl pin (int); inner key = Quisk band string; value = ATR-1000 memory ID 1-255.
+# Add or edit pin entries to match your antenna/tuner setup.
+atr1000_band_memory_map = {
+  0: {             # Pin 0 (e.g. dipole / primary antenna)
+    "10":  1,      # 10m  -> M1
+    "12":  2,      # 12m  -> M2
+    "15":  3,      # 15m  -> M3
+    "17":  4,      # 17m  -> M4
+    "20":  5,      # 20m  -> M5
+    "30":  6,      # 30m  -> M6
+    "40":  7,      # 40m  -> M7
+    "80":  8,      # 80m  -> M8
+    "160": 9,      # 160m -> M9
+  },
+  1: {             # Pin 1 (e.g. vertical / secondary antenna)
+  },
+  2: {             # Pin 2
+  },
+  3: {             # Pin 3
+  },
+}
+
+mqtt_host = station_host_map["mqtt"]["host"]
+mqtt_port = int(station_host_map["mqtt"]["port"])
+mqtt_user = None
+mqtt_pass = None
+lz1aq_host = station_host_map["lz1aq"]["host"]
+lz1aq_port = int(station_host_map["lz1aq"]["port"])
+lz1aq_timeout = float(station_host_map["lz1aq"]["timeout"])
+switchctl_host = station_host_map["switchctl"]["host"]
+switchctl_port = int(station_host_map["switchctl"]["port"])
+switchctl_timeout = float(station_host_map["switchctl"]["timeout"])
+xpa125b_host = station_host_map["xpa125b"]["host"]
+xpa125b_fallback_hosts = tuple(station_host_map["xpa125b"].get("fallback_hosts", ()))
+xpa125b_port = int(station_host_map["xpa125b"]["port"])
+xpa125b_timeout = float(station_host_map["xpa125b"]["timeout"])
+atr1000_host = station_host_map["atr1000"]["host"]
+atr1000_port = int(station_host_map["atr1000"]["port"])
+atr1000_timeout = float(station_host_map["atr1000"]["timeout"])
+atu100_host = station_host_map["atu100"]["host"]
+atu100_fallback_hosts = tuple(station_host_map["atu100"].get("fallback_hosts", ()))
+atu100_port = int(station_host_map["atu100"]["port"])
+atu100_timeout = float(station_host_map["atu100"]["timeout"])
+xpa125b_relay_button_config = (
+  {"label": "Power", "relay_index": 3, "short_press_ms": 2000, "long_press_ms": 1000, "power_button": True},
+  {"label": "Relay 1", "relay_index": 0, "short_press_ms": 400, "long_press_ms": 1000},
+  {"label": "Relay 2", "relay_index": 1, "short_press_ms": 400, "long_press_ms": 1000},
+  {"label": "Relay 3", "relay_index": 2, "short_press_ms": 400, "long_press_ms": 1000},
+)
+
+# Station config is loaded from a YAML file pointed to by:
+#   QUISK_STATION_PROFILES=/path/to/station_config.yaml
+#
+# The YAML file is keyed by radio profile name. Set the active profile in your
+# Quisk radio config file with:
+#   station_profile = "<name>"
+# Or override at runtime for all radio configs with:
+#   QUISK_STATION_PROFILE=<name>
+#
+# Each profile can specify: equipment, hosts, mqtt credentials/topics,
+# xpa125b_relays, and atr1000_band_memory. See station_config.yaml for the
+# full schema. If the env var is not set or the file cannot be read, the
+# built-in defaults below are used.
+
+_station_equipment_profiles_builtin = {
+  "default": frozenset({"mqtt", "xpa125b", "atr1000", "lz1aq", "switchctl", "esp32swr", "atu100"}),
+}
+
+def _load_station_config():
+  """Load full per-profile config dict from YAML. Returns {profile_name: cfg} or None."""
+  config_path = os.environ.get("QUISK_STATION_PROFILES", "")
+  if not config_path:
+    return None
+  if _yaml is None:
+    print("station_hardware: PyYAML not installed; cannot load %s" % config_path)
+    return None
+  try:
+    with open(config_path, "r") as f:
+      raw = _yaml.safe_load(f)
+    if not isinstance(raw, dict):
+      raise ValueError("Top-level value must be a mapping")
+    # Support both {profiles: {name: cfg}} and flat {name: cfg}
+    profiles = raw.get("profiles", raw)
+    if not isinstance(profiles, dict):
+      raise ValueError("'profiles' key must be a mapping")
+    print("station_hardware: loaded config from %s: profiles=%s" % (config_path, list(profiles.keys())))
+    return profiles
+  except Exception as e:
+    print("station_hardware: failed to load %s: %s" % (config_path, e))
+    return None
+
+_station_yaml_profiles = _load_station_config()
+
+def _build_equipment_profiles(yaml_profiles):
+  if not yaml_profiles:
+    return _station_equipment_profiles_builtin
+  loaded = {}
+  for name, profile in yaml_profiles.items():
+    eq = profile.get("equipment", []) if isinstance(profile, dict) else []
+    loaded[str(name)] = frozenset(str(k) for k in eq)
+  if "default" not in loaded:
+    loaded["default"] = _station_equipment_profiles_builtin["default"]
+  return loaded
+
+station_equipment_profiles = _build_equipment_profiles(_station_yaml_profiles)
+
+class Hardware(BaseHardware):
+  REG_IOBOARD_TOGGLE = 11
+  def __init__(self, app, conf):
+    BaseHardware.__init__(self, app, conf)
+    _profile_name = os.environ.get(
+      'QUISK_STATION_PROFILE',
+      getattr(conf, 'station_profile', 'default')
+    )
+    self.station_equipment = frozenset(
+      station_equipment_profiles.get(_profile_name, station_equipment_profiles['default'])
+    )
+
+    # Resolve the YAML profile for this radio; fall back to empty dict (uses module defaults)
+    _yaml_profile = {}
+    if _station_yaml_profiles:
+      _yaml_profile = _station_yaml_profiles.get(
+        _profile_name, _station_yaml_profiles.get('default', {})
+      )
+
+    # --- Connection / host config (YAML overrides module-level defaults) ---
+    _hosts = _yaml_profile.get("hosts", {})
+
+    def _hget(device, field, default):
+      return _hosts.get(device, {}).get(field, default)
+
+    self.mqtt_host = _hget("mqtt", "host", mqtt_host)
+    self.mqtt_port = int(_hget("mqtt", "port", mqtt_port))
+
+    _mqtt_cfg = _yaml_profile.get("mqtt", {})
+    self.mqtt_user = _mqtt_cfg.get("user", mqtt_user) or None
+    self.mqtt_pass = _mqtt_cfg.get("pass", mqtt_pass) or None
+
+    self.lz1aq_host = _hget("lz1aq", "host", lz1aq_host)
+    self.lz1aq_port = int(_hget("lz1aq", "port", lz1aq_port))
+    self.lz1aq_timeout = float(_hget("lz1aq", "timeout", lz1aq_timeout))
+
+    self.switchctl_host = _hget("switchctl", "host", switchctl_host)
+    self.switchctl_port = int(_hget("switchctl", "port", switchctl_port))
+    self.switchctl_timeout = float(_hget("switchctl", "timeout", switchctl_timeout))
+
+    _xpa_cfg = _hosts.get("xpa125b", {})
+    self.xpa125b_host = _xpa_cfg.get("host", xpa125b_host)
+    _fb = _xpa_cfg.get("fallback_hosts", list(xpa125b_fallback_hosts))
+    self.xpa125b_fallback_hosts = tuple(_fb) if isinstance(_fb, (list, tuple)) else xpa125b_fallback_hosts
+    self.xpa125b_port = int(_xpa_cfg.get("port", xpa125b_port))
+    self.xpa125b_timeout = float(_xpa_cfg.get("timeout", xpa125b_timeout))
+    self.xpa125b_active_host = self.xpa125b_host
+
+    _atr_cfg = _hosts.get("atr1000", {})
+    self.atr1000_host = _atr_cfg.get("host", atr1000_host)
+    self.atr1000_port = int(_atr_cfg.get("port", atr1000_port))
+    self.atr1000_timeout = float(_atr_cfg.get("timeout", atr1000_timeout))
+
+    _atu_cfg = _hosts.get("atu100", {})
+    self.atu100_host = _atu_cfg.get("host", atu100_host)
+    _atu_fb = _atu_cfg.get("fallback_hosts", list(atu100_fallback_hosts))
+    self.atu100_fallback_hosts = tuple(_atu_fb) if isinstance(_atu_fb, (list, tuple)) else atu100_fallback_hosts
+    self.atu100_port = int(_atu_cfg.get("port", atu100_port))
+    self.atu100_timeout = float(_atu_cfg.get("timeout", atu100_timeout))
+    self.atu100_active_host = self.atu100_host
+
+    # --- XPA125B relay button config ---
+    _relay_cfg = _yaml_profile.get("xpa125b_relays", None)
+    if _relay_cfg and isinstance(_relay_cfg, list):
+      self.xpa125b_relay_button_config = tuple(dict(item) for item in _relay_cfg)
+    else:
+      self.xpa125b_relay_button_config = tuple(dict(item) for item in xpa125b_relay_button_config)
+
+    # --- ATR-1000 band/memory map ---
+    _band_mem = _yaml_profile.get("atr1000_band_memory", None)
+    if _band_mem and isinstance(_band_mem, dict):
+      self.atr1000_band_memory_map = {
+        int(pin): {str(band): int(mem) for band, mem in (bands or {}).items()}
+        for pin, bands in _band_mem.items()
+      }
+    else:
+      self.atr1000_band_memory_map = dict(atr1000_band_memory_map)
+
+    # --- MQTT topics (overridable from YAML) ---
+    _mqtt_topics = _mqtt_cfg.get("topics", {})
+    self.topic_setband = _mqtt_topics.get("setband", "xpa125b/setband")
+    self.topic_status = _mqtt_topics.get("status", "xpa125b/#")
+    self.topic_swr = _mqtt_topics.get("swr", "esp32swr/raw")
+
+    # --- Runtime state ---
+    self.amp_band = "Unknown"
+    self.current_band = "Unknown"
+    self.mqtt_connected = False
+    self.ioboard_toggle_value = 0
+    self.ioboard_toggle_sent = False
+    self.ioboard_toggle_retry = 0
+    self.swr_data = None
+    self.last_swr_time = 0.0
+    self.swr_stale_seconds = 1.5
+    self.lz1aq_power = None
+    self.lz1aq_mode = None
+    self.lz1aq_connected = False
+    self.lz1aq_poll_interval = 1.0
+    self.lz1aq_poll_next = 0.0
+    self.switchctl_power = None
+    self.switchctl_pin = None
+    self.switchctl_connected = False
+    self.switchctl_poll_interval = 1.0
+    self.switchctl_poll_next = 0.0
+    self.control_poll_interval = 1.0
+    self.control_polling_enabled = True
+    self.xpa125b_connected = False
+    self.xpa125b_power_state = None
+    self.xpa125b_poll_interval = 2.0
+    self.xpa125b_poll_next = 0.0
+    self.xpa125b_polling_enabled = True
+    self.xpa125b_sync_in_progress = False
+    self.atr1000_connected = False
+    self.atr1000_socket = None
+    self.atr1000_socket_lock = threading.Lock()
+    self.atr1000_polling_enabled = True
+    self.atr1000_swr = None
+    self.atr1000_fwd = None
+    self.atr1000_inductance = None
+    self.atr1000_capacitance = None
+    self.atr1000_network = None
+    self.atr1000_tuned = None
+    self.atr1000_desired_memory_id = None
+    self.atr1000_last_applied_memory_id = None
+    self.atu100_connected = False
+    self.atu100_status = None
+    self.atu100_polling_enabled = True
+    self.atu100_last_tune = 0.0
+    self.atu100_last_tune_band = None
+    
+    self.client = mqtt.Client()
+    if self.mqtt_user and self.mqtt_pass:
+      self.client.username_pw_set(self.mqtt_user, self.mqtt_pass)
+      
+    self.client.on_connect = self.on_connect
+    self.client.on_message = self.on_message
+    self.client.on_disconnect = self.on_disconnect
+
+    if 'mqtt' in self.station_equipment:
+      self.thread = threading.Thread(target=self.mqtt_loop)
+      self.thread.daemon = True
+      self.thread.start()
+
+    if 'lz1aq' in self.station_equipment or 'switchctl' in self.station_equipment or 'atu100' in self.station_equipment:
+      self.control_thread = threading.Thread(target=self.control_loop)
+      self.control_thread.daemon = True
+      self.control_thread.start()
+
+    if 'xpa125b' in self.station_equipment:
+      self.xpa_thread = threading.Thread(target=self.xpa_loop)
+      self.xpa_thread.daemon = True
+      self.xpa_thread.start()
+
+    if 'atr1000' in self.station_equipment:
+      self.atr1000_thread = threading.Thread(target=self.atr1000_loop)
+      self.atr1000_thread.daemon = True
+      self.atr1000_thread.start()
+
+    # Sync XPA125B controller config on startup
+    if 'xpa125b' in self.station_equipment:
+      self._StartXpa125bSyncConfigAsync()
+
+  def xpa_loop(self):
+    while self.xpa125b_polling_enabled:
+      try:
+        self.PollXpa125bConfig()
+      except Exception:
+        pass
+      time.sleep(self.xpa125b_poll_interval)
+
+  def control_loop(self):
+    while self.control_polling_enabled:
+      if 'switchctl' in self.station_equipment:
+        try:
+          self.PollSwitchCtlStatus()
+        except Exception:
+          pass
+      if 'lz1aq' in self.station_equipment:
+        try:
+          self.PollLz1aqStatus()
+        except Exception:
+          pass
+      if 'atu100' in self.station_equipment:
+        try:
+          self.PollAtu100Status()
+        except Exception:
+          pass
+      time.sleep(self.control_poll_interval)
+
+  def _FormatAmpLabel(self):
+    yellow = wx.Colour(220, 200, 0)
+    green = wx.Colour(0, 200, 0)
+    red = wx.Colour(220, 60, 60)
+    normal = self.conf.color_freq_txt
+    if not self.xpa125b_connected:
+      if self.xpa125b_sync_in_progress:
+        return " AMP: Syncing... ", yellow
+      if self.current_band != "Unknown":
+        return " AMP: OFFLINE (want %s) " % self.current_band, red
+      return " AMP: OFFLINE ", red
+    if self.amp_band != "Unknown" and self.current_band != "Unknown":
+      if self.amp_band == self.current_band:
+        return " AMP: %s " % self.amp_band, green
+      return " AMP: %s (want %s) " % (self.amp_band, self.current_band), yellow
+    if self.amp_band != "Unknown":
+      return " AMP: %s " % self.amp_band, normal
+    if self.current_band != "Unknown":
+      return " AMP: -> %s " % self.current_band, yellow
+    return " AMP: Unknown ", normal
+
+  def _ApplyAmpLabel(self, label, color):
+    if hasattr(self.application, 'amp_status'):
+      self.application.amp_status.SetLabel(label)
+      self.application.amp_status.TextCtrl.SetForegroundColour(color)
+      self.application.amp_status.TextCtrl.Refresh()
+
+  def _FormatSwrLabel(self):
+    normal = self.conf.color_freq_txt
+    green = wx.Colour(0, 200, 0)
+    yellow = wx.Colour(220, 200, 0)
+    red = wx.Colour(220, 60, 60)
+    if not self.swr_data:
+      return " SWR: --- ", normal
+    fwd = self.swr_data.get("fwd", "0.000")
+    rev = self.swr_data.get("rev", "0.000")
+    vswr = self.swr_data.get("vswr", "1.000")
+    try:
+      vswr_value = float(vswr)
+    except Exception:
+      return " SWR %s  F %s  R %s " % (vswr, fwd, rev), normal
+    if vswr_value > 2.0:
+      color = red
+    elif vswr_value > 1.5:
+      color = yellow
+    else:
+      color = green
+    return " SWR %s  F %s  R %s " % (vswr, fwd, rev), color
+
+  def _ApplySwrLabel(self, label, color):
+    if hasattr(self.application, 'swr_status'):
+      self.application.swr_status.SetLabel(label)
+      self.application.swr_status.TextCtrl.SetForegroundColour(color)
+      self.application.swr_status.TextCtrl.Refresh()
+
+  def _UpdateSwrLabel(self):
+    label, color = self._FormatSwrLabel()
+    wx.CallAfter(self._ApplySwrLabel, label, color)
+
+  def _UpdateAmpLabel(self):
+    label, color = self._FormatAmpLabel()
+    wx.CallAfter(self._ApplyAmpLabel, label, color)
+
+  def mqtt_loop(self):
+    while True:
+      try:
+        self.client.connect(self.mqtt_host, self.mqtt_port, 60)
+        self.client.loop_forever()
+      except Exception as e:
+        print("MQTT Connection Error: %s" % str(e))
+        time.sleep(5)
+
+  def on_connect(self, client, userdata, flags, rc):
+    if rc == 0:
+      self.mqtt_connected = True
+      if 'xpa125b' in self.station_equipment:
+        client.subscribe(self.topic_status)
+        if self.current_band != "Unknown":
+          self.send_band(self.current_band)
+      if 'esp32swr' in self.station_equipment:
+        client.subscribe(self.topic_swr)
+    else:
+      self.mqtt_connected = False
+    self._UpdateAmpLabel()
+
+  def on_disconnect(self, client, userdata, rc):
+    self.mqtt_connected = False
+    self._UpdateAmpLabel()
+
+  def on_message(self, client, userdata, msg):
+    if 'xpa125b' in self.station_equipment:
+      if msg.topic == "xpa125b/band":
+        self.amp_band = msg.payload.decode().strip()
+        self._UpdateAmpLabel()
+        self.check_tx_inhibit()
+      elif msg.topic == "xpa125b/status":
+        pass
+    if 'esp32swr' in self.station_equipment:
+      if msg.topic == self.topic_swr:
+        try:
+          self.swr_data = json.loads(msg.payload.decode().strip())
+          self.last_swr_time = time.monotonic()
+          self._UpdateSwrLabel()
+        except Exception:
+          pass
+
+  def send_band(self, band):
+    if self.mqtt_connected and 'xpa125b' in self.station_equipment:
+      self.client.publish(self.topic_setband, band)
+
+  def _NormalizeLz1aqMode(self, mode):
+    text = str(mode).strip()
+    mapping = {
+      "A": "LoopA",
+      "loopA": "LoopA",
+      "LoopA": "LoopA",
+      "B": "LoopB",
+      "loopB": "LoopB",
+      "LoopB": "LoopB",
+      "Crossed": "Crossed",
+      "crossed": "Crossed",
+      "Vertical": "Vertical",
+      "vertical": "Vertical",
+    }
+    return mapping.get(text)
+
+  def _ApplyLz1aqStatus(self, data):
+    power_raw = str(data.get("power", "")).strip().lower()
+    if power_raw == "true":
+      self.lz1aq_power = True
+    elif power_raw == "false":
+      self.lz1aq_power = False
+    mode = self._NormalizeLz1aqMode(data.get("mode", ""))
+    if mode:
+      self.lz1aq_mode = mode
+
+  def _Lz1aqRequest(self, endpoint):
+    url = "http://%s:%d%s" % (self.lz1aq_host, self.lz1aq_port, endpoint)
+    try:
+      with urllib.request.urlopen(url, timeout=self.lz1aq_timeout) as response:
+        payload = response.read().decode("utf-8", "ignore")
+      data = json.loads(payload)
+      self._ApplyLz1aqStatus(data)
+      self.lz1aq_connected = True
+      return True
+    except Exception:
+      self.lz1aq_connected = False
+      return False
+
+  def PollLz1aqStatus(self):
+    return self._Lz1aqRequest("/api/status")
+
+  def SetLz1aqPower(self, enabled):
+    if enabled:
+      return self._Lz1aqRequest("/api/on")
+    return self._Lz1aqRequest("/api/off")
+
+  def SetLz1aqMode(self, mode):
+    mode = self._NormalizeLz1aqMode(mode)
+    if mode == "LoopA":
+      return self._Lz1aqRequest("/api/loopA")
+    if mode == "LoopB":
+      return self._Lz1aqRequest("/api/loopB")
+    if mode == "Crossed":
+      return self._Lz1aqRequest("/api/crossed")
+    if mode == "Vertical":
+      return self._Lz1aqRequest("/api/vertical")
+    return False
+
+  def GetLz1aqPower(self):
+    return self.lz1aq_power
+
+  def GetLz1aqMode(self):
+    return self.lz1aq_mode
+
+  def _ApplySwitchCtlStatus(self, data):
+    power_raw = data.get("power", None)
+    if power_raw is not None:
+      power_text = str(power_raw).strip().lower()
+      if power_text == "true":
+        self.switchctl_power = True
+      elif power_text == "false":
+        self.switchctl_power = False
+    enabled_raw = data.get("enabled", None)
+    if enabled_raw is not None:
+      enabled_text = str(enabled_raw).strip().lower()
+      if enabled_text == "true":
+        self.switchctl_power = True
+      elif enabled_text == "false":
+        self.switchctl_power = False
+    pin_raw = data.get("pin", None)
+    try:
+      pin = int(str(pin_raw).strip())
+    except Exception:
+      pin = None
+    if pin is not None and -1 <= pin <= 5:
+      self.switchctl_pin = pin
+      if enabled_raw is None and power_raw is None:
+        self.switchctl_power = pin >= 0
+
+  def _SwitchCtlRequest(self, endpoint):
+    url = "http://%s:%d%s" % (self.switchctl_host, self.switchctl_port, endpoint)
+    try:
+      with urllib.request.urlopen(url, timeout=self.switchctl_timeout) as response:
+        payload = response.read().decode("utf-8", "ignore")
+      data = json.loads(payload)
+      self._ApplySwitchCtlStatus(data)
+      self.switchctl_connected = True
+      return True
+    except Exception:
+      self.switchctl_connected = False
+      return False
+
+  def PollSwitchCtlStatus(self):
+    return self._SwitchCtlRequest("/api/status")
+
+  def SetSwitchCtlPower(self, enabled):
+    if enabled:
+      return self._SwitchCtlRequest("/api/on")
+    return self._SwitchCtlRequest("/api/off")
+
+  def SetSwitchCtlPin(self, pin):
+    try:
+      pin = int(pin)
+    except Exception:
+      return False
+    if pin < 0 or pin > 5:
+      return False
+    return self._SwitchCtlRequest("/api/on?pin=%d" % pin)
+
+  def GetSwitchCtlPower(self):
+    return self.switchctl_power
+
+  def GetSwitchCtlPin(self):
+    return self.switchctl_pin
+
+  # --- ATU-100 WiFi controller (atu100wifi) -------------------------------
+  # REST API on the ESP32 controller:
+  #   /api/status  JSON state (power, swr, pwr_in/out, efficiency, L, C, ...)
+  #   /api/tune    pulse the ATU TUNE line (tuning starts on the next RF)
+  #   /api/reset   pulse the ATU RESET line
+  #   /api/auto    toggle automatic tuning mode
+  #   /api/bypass  toggle bypass
+
+  def _Atu100Request(self, endpoint, params=None):
+    hosts = []
+    if self.atu100_active_host:
+      hosts.append(self.atu100_active_host)
+    if self.atu100_host and self.atu100_host not in hosts:
+      hosts.append(self.atu100_host)
+    for host in self.atu100_fallback_hosts:
+      if host and host not in hosts:
+        hosts.append(host)
+
+    for host in hosts:
+      url = "http://%s:%d%s" % (host, self.atu100_port, endpoint)
+      if params:
+        url += "?" + urllib.parse.urlencode(params)
+      try:
+        with urllib.request.urlopen(url, timeout=self.atu100_timeout) as response:
+          payload = response.read().decode("utf-8", "ignore")
+        self.atu100_connected = True
+        self.atu100_active_host = host
+        try:
+          return json.loads(payload)
+        except Exception:
+          return payload
+      except Exception:
+        continue
+
+    self.atu100_connected = False
+    return None
+
+  def GetAtu100Connected(self):
+    return self.atu100_connected
+
+  def GetAtu100Status(self):
+    return self.atu100_status
+
+  def PollAtu100Status(self):
+    response = self._Atu100Request("/api/status")
+    if isinstance(response, dict):
+      self.atu100_status = response
+      wx.CallAfter(self._UpdateAtu100Label)
+      return True
+    return False
+
+  def Atu100Tune(self):
+    return self._Atu100Request("/api/tune") is not None
+
+  def Atu100Reset(self):
+    return self._Atu100Request("/api/reset") is not None
+
+  def Atu100Auto(self):
+    return self._Atu100Request("/api/auto") is not None
+
+  def Atu100Bypass(self):
+    return self._Atu100Request("/api/bypass") is not None
+
+  def _FormatAtu100Label(self):
+    normal = self.conf.color_freq_txt
+    green = wx.Colour(0, 200, 0)
+    yellow = wx.Colour(220, 200, 0)
+    if not self.atu100_connected:
+      return " ATU: --- ", normal
+    st = self.atu100_status
+    if not isinstance(st, dict):
+      return " ATU: ... ", yellow
+
+    def _val(key):
+      value = st.get(key)
+      if value is None:
+        return None
+      text = str(value).strip()
+      if not text or text == "--":
+        return None
+      return text
+
+    parts = []
+    if _val("swr"):
+      parts.append("SWR %s" % _val("swr"))
+    if _val("pwr_out"):
+      parts.append("%sW" % _val("pwr_out"))
+    if _val("inductance"):
+      parts.append("%suH" % _val("inductance"))
+    if _val("capacitance"):
+      parts.append("%spF" % _val("capacitance"))
+
+    tuning = str(st.get("tuning", "")).lower() == "true"
+    power_on = str(st.get("power", "")).lower() == "true"
+    if tuning:
+      parts.append("Tuning")
+    elif not power_on:
+      parts.append("Off")
+    elif str(st.get("auto_mode", "")).lower() == "true":
+      parts.append("Auto")
+    else:
+      parts.append("Man")
+
+    label = " ATU: " + "  ".join(parts) + " "
+    if tuning:
+      color = yellow
+    elif power_on:
+      color = green
+    else:
+      color = normal
+    return label, color
+
+  def _ApplyAtu100Label(self, label, color):
+    if hasattr(self.application, 'atu100_status'):
+      self.application.atu100_status.SetLabel(label)
+      self.application.atu100_status.TextCtrl.SetForegroundColour(color)
+      self.application.atu100_status.TextCtrl.Refresh()
+
+  def _UpdateAtu100Label(self):
+    label, color = self._FormatAtu100Label()
+    self._ApplyAtu100Label(label, color)
+
+  def _ScheduleAtu100Tune(self, band):
+    """Start a tune cycle after a band change.
+
+    The controller pulses the ATU TUNE line; the ATU-100 then retunes on the
+    next RF. Debounced per band so spinning across a band edge does not fire
+    repeated tune pulses.
+    """
+    now = time.monotonic()
+    if band == self.atu100_last_tune_band and now - self.atu100_last_tune < 2.0:
+      return
+    self.atu100_last_tune_band = band
+    self.atu100_last_tune = now
+    threading.Thread(target=self.Atu100Tune, daemon=True).start()
+
+  def _IoBoardAvailable(self):
+    return bool(getattr(self, 'io_board', None) and getattr(self.io_board, 'have_IO_Board', False))
+
+  def IsIoBoardAvailable(self):
+    return self._IoBoardAvailable()
+
+  def GetIoBoardToggle(self):
+    return self.ioboard_toggle_value
+
+  def SetIoBoardToggle(self, value):
+    self.ioboard_toggle_value = 1 if value else 0
+    self.ioboard_toggle_retry = 3
+    if self._IoBoardAvailable():
+      self.WriteI2C(0x7d, 0x1D, self.REG_IOBOARD_TOGGLE, self.ioboard_toggle_value)
+      self.ioboard_toggle_sent = True
+      self.ioboard_toggle_retry -= 1
+
+  def _Atr1000WsConnect(self):
+    s = socket.create_connection((self.atr1000_host, self.atr1000_port), timeout=self.atr1000_timeout)
+    s.settimeout(5.0)
+    key = base64.b64encode(os.urandom(16)).decode()
+    upgrade = (
+      "GET / HTTP/1.1\r\n"
+      "Host: %s:%d\r\n"
+      "Upgrade: websocket\r\n"
+      "Connection: Upgrade\r\n"
+      "Sec-WebSocket-Key: %s\r\n"
+      "Sec-WebSocket-Version: 13\r\n"
+      "\r\n"
+    ) % (self.atr1000_host, self.atr1000_port, key)
+    s.sendall(upgrade.encode())
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+      chunk = s.recv(1024)
+      if not chunk:
+        raise IOError("ATR-1000 WebSocket handshake failed")
+      buf += chunk
+    return s
+
+  def _Atr1000WsSend(self, s, data):
+    mask = os.urandom(4)
+    masked = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+    s.sendall(bytes([0x82, 0x80 | len(data)]) + mask + masked)
+
+  def _Atr1000WsRecvFrame(self, s):
+    header = b""
+    while len(header) < 2:
+      try:
+        chunk = s.recv(2 - len(header))
+      except socket.timeout:
+        return b""
+      if not chunk:
+        return None
+      header += chunk
+    length = header[1] & 0x7F
+    if length == 126:
+      ext = b""
+      while len(ext) < 2:
+        try:
+          chunk = s.recv(2 - len(ext))
+        except socket.timeout:
+          return b""
+        if not chunk:
+          return None
+        ext += chunk
+      length = struct.unpack(">H", ext)[0]
+    elif length == 127:
+      ext = b""
+      while len(ext) < 8:
+        try:
+          chunk = s.recv(8 - len(ext))
+        except socket.timeout:
+          return b""
+        if not chunk:
+          return None
+        ext += chunk
+      length = struct.unpack(">Q", ext)[0]
+    payload = b""
+    while len(payload) < length:
+      try:
+        chunk = s.recv(length - len(payload))
+      except socket.timeout:
+        return b""
+      if not chunk:
+        return None
+      payload += chunk
+    return payload
+
+  def _Atr1000ParseFrame(self, s, payload):
+    if len(payload) < 2 or payload[0] != 0xFF:
+      return
+    cmd = payload[1]
+    if cmd == 2 and len(payload) >= 10:  # SCMD_METER_STATUS
+      swr_raw = struct.unpack_from("<H", payload, 4)[0]
+      fwd = struct.unpack_from("<H", payload, 6)[0]
+      self.atr1000_swr = round(swr_raw / 100.0, 2) if swr_raw >= 100 else float(swr_raw)
+      self.atr1000_fwd = fwd
+      wx.CallAfter(self._UpdateAtr1000Label)
+    elif cmd == 5 and len(payload) >= 9:  # SCMD_RELAY_STATUS
+      sw = payload[3]
+      ind = payload[4]
+      cap = payload[5]
+      L = struct.unpack_from("<H", payload, 6)[0] / 100.0
+      C = struct.unpack_from("<H", payload, 8)[0]
+      self.atr1000_network = "LC" if sw == 0 else "CL"
+      self.atr1000_inductance = L
+      self.atr1000_capacitance = C
+      self.atr1000_tuned = (ind > 0 or cap > 0)
+      wx.CallAfter(self._UpdateAtr1000Label)
+    elif cmd == 254:  # SCMD_TEST - device keepalive ping
+      try:
+        self._Atr1000WsSend(s, bytes([0xFF, 0xFD, 0x00]))
+      except Exception:
+        pass
+
+  def atr1000_loop(self):
+    while self.atr1000_polling_enabled:
+      s = None
+      try:
+        s = self._Atr1000WsConnect()
+        with self.atr1000_socket_lock:
+          self.atr1000_socket = s
+        self.atr1000_connected = True
+        wx.CallAfter(self._UpdateAtr1000Label)
+        self._Atr1000WsSend(s, bytes([0xFF, 0x01, 0x00]))  # SCMD_SYNC
+        if self.atr1000_desired_memory_id is not None:
+          self.Atr1000ApplyMemory(self.atr1000_desired_memory_id)
+        while self.atr1000_polling_enabled:
+          payload = self._Atr1000WsRecvFrame(s)
+          if payload is None:
+            break
+          if payload == b"":
+            continue
+          self._Atr1000ParseFrame(s, payload)
+      except Exception:
+        pass
+      finally:
+        with self.atr1000_socket_lock:
+          self.atr1000_socket = None
+        if s:
+          try:
+            s.close()
+          except Exception:
+            pass
+      self.atr1000_connected = False
+      wx.CallAfter(self._UpdateAtr1000Label)
+      if self.atr1000_polling_enabled:
+        time.sleep(5.0)
+
+  def _Atr1000SendFrame(self, data):
+    with self.atr1000_socket_lock:
+      s = self.atr1000_socket
+      if s is None:
+        return False
+      try:
+        self._Atr1000WsSend(s, data)
+        return True
+      except Exception as e:
+        print("ATR-1000 send error: %s" % e)
+        self.atr1000_socket = None
+        return False
+
+  def Atr1000ApplyMemory(self, memory_id):
+    try:
+      memory_id = int(memory_id)
+    except Exception:
+      return False
+    if memory_id < 1 or memory_id > 255:
+      return False
+    self.atr1000_desired_memory_id = memory_id
+    ok = self._Atr1000SendFrame(bytes([0xFF, 0x08, 0x01, memory_id]))
+    if ok:
+      self.atr1000_last_applied_memory_id = memory_id
+    return ok
+
+  def Atr1000FineTune(self):
+    return self._Atr1000SendFrame(bytes([0xFF, 0x04, 0x01, 0x03]))
+
+  def GetAtr1000Connected(self):
+    return self.atr1000_connected
+
+  def _FormatAtr1000Label(self):
+    normal = self.conf.color_freq_txt
+    green = wx.Colour(0, 200, 0)
+    yellow = wx.Colour(220, 200, 0)
+    if not self.atr1000_connected:
+      return " ATR: --- ", normal
+    parts = []
+    memory_id = self.atr1000_last_applied_memory_id or self.atr1000_desired_memory_id
+    if memory_id is not None:
+      parts.append("M%d" % int(memory_id))
+    if self.atr1000_swr is not None and self.atr1000_swr > 0:
+      parts.append("SWR %.2f" % self.atr1000_swr)
+    if self.atr1000_fwd is not None:
+      parts.append("%dW" % self.atr1000_fwd)
+    if self.atr1000_network is not None:
+      parts.append(self.atr1000_network)
+    if self.atr1000_inductance is not None:
+      parts.append("%.1fuH" % self.atr1000_inductance)
+    if self.atr1000_capacitance is not None:
+      parts.append("%dpF" % self.atr1000_capacitance)
+    if self.atr1000_tuned is not None:
+      parts.append("Tuned" if self.atr1000_tuned else "Bypass")
+    label = " ATR: " + "  ".join(parts) + " " if parts else " ATR: -- "
+    color = green if self.atr1000_tuned else (yellow if self.atr1000_tuned is False else normal)
+    return label, color
+
+  def _ApplyAtr1000Label(self, label, color):
+    if hasattr(self.application, 'atr1000_status'):
+      self.application.atr1000_status.SetLabel(label)
+      self.application.atr1000_status.TextCtrl.SetForegroundColour(color)
+      self.application.atr1000_status.TextCtrl.Refresh()
+
+  def _UpdateAtr1000Label(self):
+    label, color = self._FormatAtr1000Label()
+    self._ApplyAtr1000Label(label, color)
+
+  def ChangeBand(self, band):
+    BaseHardware.ChangeBand(self, band)
+    self.current_band = band
+    self._UpdateAmpLabel()
+    self.send_band(band)
+    self.check_tx_inhibit()
+    pin = self.switchctl_pin if self.switchctl_pin is not None else 0
+    try:
+      pin = int(pin)
+    except Exception:
+      pin = 0
+    pin_map = self.atr1000_band_memory_map.get(pin, {})
+    memory_id = pin_map.get(str(band))
+    if memory_id is not None:
+      self.atr1000_desired_memory_id = int(memory_id)
+      threading.Thread(target=self.Atr1000ApplyMemory, args=(memory_id,), daemon=True).start()
+    if 'atu100' in self.station_equipment:
+      self._ScheduleAtu100Tune(band)
+
+  def check_tx_inhibit(self):
+    # Task 2 continued: The amplifier band should match the selected band before allowing transmit.
+    if self.amp_band == self.current_band:
+      self.application.tx_inhibit = False
+    else:
+      self.application.tx_inhibit = True
+
+  def HeartBeat(self):
+    BaseHardware.HeartBeat(self)
+    if self._IoBoardAvailable():
+      if not self.ioboard_toggle_sent or self.ioboard_toggle_retry > 0:
+        self.SetIoBoardToggle(self.ioboard_toggle_value)
+    else:
+      self.ioboard_toggle_sent = False
+    if self.swr_data is not None and time.monotonic() - self.last_swr_time > self.swr_stale_seconds:
+      self.swr_data = None
+      self._UpdateSwrLabel()
+
+  def _Xpa125bRequest(self, endpoint, params=None, preferred_hosts=None):
+    hosts = []
+    if preferred_hosts:
+      for host in preferred_hosts:
+        if host and host not in hosts:
+          hosts.append(host)
+    if self.xpa125b_active_host:
+      hosts.append(self.xpa125b_active_host)
+    if self.xpa125b_host and self.xpa125b_host not in hosts:
+      hosts.append(self.xpa125b_host)
+    for host in self.xpa125b_fallback_hosts:
+      if host and host not in hosts:
+        hosts.append(host)
+
+    for host in hosts:
+      url = "http://%s:%d%s" % (host, self.xpa125b_port, endpoint)
+      if params:
+        url += "?" + urllib.parse.urlencode(params)
+      try:
+        with urllib.request.urlopen(url, timeout=self.xpa125b_timeout) as response:
+          payload = response.read().decode("utf-8", "ignore")
+        self.xpa125b_connected = True
+        self.xpa125b_active_host = host
+        try:
+          return json.loads(payload)
+        except Exception:
+          return payload
+      except Exception:
+        continue
+
+    self.xpa125b_connected = False
+    return None
+
+  def GetXpa125bConnected(self):
+    return self.xpa125b_connected
+
+  def GetXpa125bRelayLabels(self):
+    return tuple(item["label"] for item in self.xpa125b_relay_button_config)
+
+  def GetXpa125bRelayButtonConfig(self):
+    return tuple(dict(item) for item in self.xpa125b_relay_button_config)
+
+  def GetXpa125bPressTime(self, relay_index, is_long=False):
+    try:
+      relay_index = int(relay_index)
+    except Exception:
+      return None
+    if relay_index < 0 or relay_index >= len(self.xpa125b_relay_button_config):
+      return None
+    key = "long_press_ms" if is_long else "short_press_ms"
+    return int(self.xpa125b_relay_button_config[relay_index][key])
+
+  def _IsXpa125bPowerButton(self, relay_index):
+    try:
+      relay_index = int(relay_index)
+    except Exception:
+      return False
+    if relay_index < 0 or relay_index >= len(self.xpa125b_relay_button_config):
+      return False
+    return bool(self.xpa125b_relay_button_config[relay_index].get("power_button", False))
+
+  def _GetXpa125bRelayApiIndex(self, relay_index):
+    try:
+      relay_index = int(relay_index)
+    except Exception:
+      return None
+    if relay_index < 0 or relay_index >= len(self.xpa125b_relay_button_config):
+      return None
+    try:
+      return int(self.xpa125b_relay_button_config[relay_index].get("relay_index", relay_index))
+    except Exception:
+      return None
+
+  def _UpdateXpa125bPowerStateFromMessage(self, message):
+    text = str(message or "").strip().lower()
+    if "power on" in text:
+      self.xpa125b_power_state = True
+    elif "power off" in text:
+      self.xpa125b_power_state = False
+
+  def PollXpa125bConfig(self):
+    response = self._Xpa125bRequest("/config")
+    if isinstance(response, dict):
+      if "power_state" in response:
+        self.xpa125b_power_state = bool(response.get("power_state"))
+      return True
+    return response is not None
+
+  def PressXpa125bRelay(self, relay_index, is_long=False, press_time_ms=None):
+    try:
+      relay_index = int(relay_index)
+    except Exception:
+      return False
+    if relay_index < 0 or relay_index >= len(self.xpa125b_relay_button_config):
+      return False
+    relay_api_index = self._GetXpa125bRelayApiIndex(relay_index)
+    if relay_api_index is None:
+      return False
+    is_power_button = self._IsXpa125bPowerButton(relay_index)
+    if press_time_ms is None:
+      if is_power_button and self.xpa125b_power_state is not None:
+        # Power timing is state-driven: OFF->ON uses short press, ON->OFF uses long press.
+        press_time_ms = self.GetXpa125bPressTime(relay_index, is_long=self.xpa125b_power_state)
+      else:
+        press_time_ms = self.GetXpa125bPressTime(relay_index, is_long=is_long)
+    try:
+      press_time_ms = int(press_time_ms)
+    except Exception:
+      return False
+    if press_time_ms <= 0:
+      return False
+    response = self._Xpa125bRequest("/pulseRelay", {
+      "relay": relay_api_index,
+      "time": press_time_ms,
+    })
+    if isinstance(response, dict):
+      ok = bool(response.get("ok", False))
+      if ok and is_power_button:
+        self._UpdateXpa125bPowerStateFromMessage(response.get("message", ""))
+        if self.xpa125b_power_state is None:
+          self.xpa125b_power_state = not bool(self.xpa125b_power_state)
+      return ok
+    if response is not None and is_power_button:
+      if self.xpa125b_power_state is None:
+        self.xpa125b_power_state = True
+      else:
+        self.xpa125b_power_state = not self.xpa125b_power_state
+    return response is not None
+
+  def _Xpa125bSyncConfig(self, preferred_hosts=None):
+    # Sync MQTT config to XPA125B controller on startup
+    # Set MQTT config
+    params = {
+      "mqttserver": self.mqtt_host,
+      "mqttuser": self.mqtt_user or "",
+      "mqttpass": self.mqtt_pass or "",
+      "mqtt": "enable"
+    }
+    self._Xpa125bRequest("/setmqttconfig", params, preferred_hosts=preferred_hosts)
+    
+    # Enable MQTT
+    self._Xpa125bRequest("/setmqtt", {"mqtt": "enable"}, preferred_hosts=preferred_hosts)
+    
+    # Set mode to mqtt
+    self._Xpa125bRequest("/setmode", {"mode": "mqtt"}, preferred_hosts=preferred_hosts)
+
+  def _Xpa125bSyncConfigWorker(self):
+    try:
+      self._Xpa125bSyncConfig(preferred_hosts=self.xpa125b_fallback_hosts)
+    except Exception:
+      pass
+    self.xpa125b_sync_in_progress = False
+    self._UpdateAmpLabel()
+
+  def _StartXpa125bSyncConfigAsync(self):
+    if self.xpa125b_sync_in_progress:
+      return
+    self.xpa125b_sync_in_progress = True
+    self._UpdateAmpLabel()
+    thread = threading.Thread(target=self._Xpa125bSyncConfigWorker)
+    thread.daemon = True
+    thread.start()
+
+  def close(self):
+    self.control_polling_enabled = False
+    self.xpa125b_polling_enabled = False
+    self.atr1000_polling_enabled = False
+    self.atu100_polling_enabled = False
+    with self.atr1000_socket_lock:
+      if self.atr1000_socket:
+        try:
+          self.atr1000_socket.close()
+        except Exception:
+          pass
+        self.atr1000_socket = None
+    if 'mqtt' in self.station_equipment:
+      self.client.disconnect()
+    BaseHardware.close(self)
