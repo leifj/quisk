@@ -82,6 +82,11 @@ profiles:
         short_press_ms: 400
         long_press_ms:  1000
 
+    # Key a tuning carrier from quisk after arming the ATU on band change
+    # (true = quisk briefly keys PTT so the ATU has RF to tune on; the ATU-100
+    # fails the tune and resets its network when there is no carrier).
+    # atu100_auto_key: true
+
     # ATR-1000 memory slot per band, keyed by switchctl antenna pin.
     # Outer key = pin number (int); inner key = Quisk band string; value = memory ID 1-255.
     atr1000_band_memory:

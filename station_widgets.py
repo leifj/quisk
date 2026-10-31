@@ -133,7 +133,8 @@ class BottomWidgets:
       if has_atu:
         atu_row = (tuner_row if has_atr else relay_row) + 1
         rows_added += 1
-        self.btnAtu100Tune = self.application.QuiskPushbutton(self.frame, self.OnBtnAtu100Tune, 'Tune')
+        self.btnAtu100Tune = self.application.QuiskCheckbutton(self.frame, self.OnBtnAtu100Tune, text='ATU Tune')
+        self.btnAtu100Tune.SetValue(False, False)
         self.gbs.Add(self.btnAtu100Tune, (atu_row, self.start_col + 0), (1, 2), flag=wx.EXPAND)
         self.gbs.Add(self.application.atu100_status, (atu_row, self.start_col + 2), (1, 6), flag=wx.EXPAND)
     else:
@@ -173,7 +174,8 @@ class BottomWidgets:
       if has_atu:
         atu_row = (tuner_row if has_atr else relay_row) + 1
         rows_added += 1
-        self.btnAtu100Tune = self.application.QuiskPushbutton(self.frame, self.OnBtnAtu100Tune, 'Tune')
+        self.btnAtu100Tune = self.application.QuiskCheckbutton(self.frame, self.OnBtnAtu100Tune, text='ATU Tune')
+        self.btnAtu100Tune.SetValue(False, False)
         self.gbs.Add(self.btnAtu100Tune, (atu_row, self.start_col + 0), flag=wx.EXPAND)
         self.gbs.Add(self.application.atu100_status, (atu_row, self.start_col + 1), (1, 5), flag=wx.EXPAND)
     self.num_rows_added += rows_added
@@ -181,6 +183,7 @@ class BottomWidgets:
     self._RefreshLz1aqControls()
     self._RefreshIoBoardToggle()
     self._RefreshXpaRelayControls()
+    self._RefreshAtu100Controls()
 
   def OnBtnSwitchPower(self, event):
     enabled = bool(self.btnSwitchPower.GetValue())
@@ -252,8 +255,22 @@ class BottomWidgets:
       threading.Thread(target=self.hardware.Atr1000FineTune, daemon=True).start()
 
   def OnBtnAtu100Tune(self, event):
-    if hasattr(self.hardware, 'Atu100Tune'):
-      threading.Thread(target=self.hardware.Atu100Tune, daemon=True).start()
+    enabled = bool(self.btnAtu100Tune.GetValue())
+    if enabled:
+      if hasattr(self.hardware, 'Atu100Tune'):
+        threading.Thread(target=self.hardware.Atu100Tune, daemon=True).start()
+    else:
+      if hasattr(self.hardware, 'Atu100Stop'):
+        threading.Thread(target=self.hardware.Atu100Stop, daemon=True).start()
+
+  def _RefreshAtu100Controls(self):
+    if not hasattr(self, 'btnAtu100Tune'):
+      return
+    tuning = False
+    if hasattr(self.hardware, 'GetAtu100Tuning'):
+      tuning = bool(self.hardware.GetAtu100Tuning())
+    if self.btnAtu100Tune.GetValue() != tuning:
+      self.btnAtu100Tune.SetValue(tuning, False)
 
   def OnChoiceAtr1000Mem(self, event):
     index = self.btnAtr1000MemSelect.GetSelection()
@@ -323,6 +340,7 @@ class BottomWidgets:
     self._RefreshLz1aqControls()
     self._RefreshIoBoardToggle()
     self._RefreshXpaRelayControls()
+    self._RefreshAtu100Controls()
 
   def __getattr__(self, name):
     return getattr(self.hermes_widgets, name)

@@ -299,6 +299,12 @@ class Hardware(BaseHardware):
     self.atu100_polling_enabled = True
     self.atu100_last_tune = 0.0
     self.atu100_last_tune_band = None
+    self.atu100_tune_active = False
+    self.atu100_keyed = False
+    # Key a tuning carrier from quisk after arming the ATU. Without RF the
+    # ATU-100 tune() fails instantly and atu_reset() zeroes the network,
+    # which looks like "TUNE then RESET" on the display.
+    self.atu100_auto_key = bool(_yaml_profile.get("atu100_auto_key", True))
     
     self.client = mqtt.Client()
     if self.mqtt_user and self.mqtt_pass:
@@ -646,8 +652,102 @@ class Hardware(BaseHardware):
       return True
     return False
 
-  def Atu100Tune(self):
-    return self._Atu100Request("/api/tune") is not None
+  def GetAtu100Tuning(self):
+    """True while a tune cycle is armed/running or a request is in flight."""
+    if self.atu100_tune_active:
+      return True
+    st = self.atu100_status
+    if isinstance(st, dict):
+      return str(st.get("tuning", "")).lower() == "true"
+    return False
+
+  def _Atu100EnsurePower(self):
+    st = self.atu100_status if isinstance(self.atu100_status, dict) else {}
+    if str(st.get("power", "")).lower() != "true":
+      if self._Atu100Request("/api/on") is None:
+        return False
+      time.sleep(2.5)          # allow the ATU to boot its LCD
+      self.PollAtu100Status()
+    return True
+
+  def _Atu100GetAppPtt(self):
+    """Read the quisk PTT button state from the GUI thread."""
+    box = {}
+    done = threading.Event()
+
+    def _read():
+      btn = getattr(self.application, 'pttButton', None)
+      box['tx'] = bool(btn.GetValue()) if btn else False
+      done.set()
+
+    wx.CallAfter(_read)
+    done.wait(1.0)
+    return box.get('tx', False)
+
+  def _Atu100WaitTxInhibit(self, timeout):
+    """Wait until quisk's amp-band TX guard clears so keying is allowed."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+      if not getattr(self.application, 'tx_inhibit', False):
+        return True
+      time.sleep(0.1)
+    return False
+
+  def _Atu100KeyCarrier(self, on):
+    app = getattr(self, 'application', None)
+    if app is not None and hasattr(app, 'SetPTT'):
+      wx.CallAfter(app.SetPTT, 1 if on else 0)
+      return True
+    return False
+
+  def Atu100Tune(self, key_carrier=None):
+    """Arm the ATU tune and key a tuning carrier until the cycle finishes.
+
+    The ATU-100 tunes only with RF on the input: the stock firmware fails
+    the tune and runs atu_reset() when there is no carrier, so the carrier
+    is keyed BEFORE the TUNE pulse lands.
+    """
+    if self.atu100_tune_active:
+      return True
+    self.atu100_tune_active = True
+    try:
+      if not self._Atu100EnsurePower():
+        return False
+      if key_carrier is None:
+        key_carrier = self.atu100_auto_key
+      if key_carrier and not self._Atu100GetAppPtt():
+        # Respect the amplifier band guard; skip keying if it stays set.
+        if not self._Atu100WaitTxInhibit(3.0):
+          key_carrier = False
+      if key_carrier:
+        self._Atu100KeyCarrier(1)
+        self.atu100_keyed = True
+        time.sleep(0.4)        # rig TX onset before the ATU samples RF
+      if self._Atu100Request("/api/tune") is None:
+        return False
+      deadline = time.monotonic() + 12.0
+      while time.monotonic() < deadline:
+        time.sleep(0.5)
+        self.PollAtu100Status()
+        st = self.atu100_status if isinstance(self.atu100_status, dict) else {}
+        if str(st.get("power", "")).lower() != "true":
+          break
+        if str(st.get("tuning", "")).lower() != "true":
+          break
+    finally:
+      if self.atu100_keyed:
+        self._Atu100KeyCarrier(0)
+        self.atu100_keyed = False
+      self.atu100_tune_active = False
+    return True
+
+  def Atu100Stop(self):
+    """Release the tuning carrier if this module keyed it."""
+    if self.atu100_keyed:
+      self._Atu100KeyCarrier(0)
+      self.atu100_keyed = False
+      return True
+    return False
 
   def Atu100Reset(self):
     return self._Atu100Request("/api/reset") is not None
