@@ -318,6 +318,7 @@ class Hardware(BaseHardware):
     self.atu100_ignore_inhibit = bool(_atu_cfg.get("ignore_inhibit", False))
     self.atu100_block_reason = None
     self.atu100_inhibit_bypassed = False
+    self.atu100_last_error = None
     
     self.client = mqtt.Client()
     if self.mqtt_user and self.mqtt_pass:
@@ -641,11 +642,16 @@ class Hardware(BaseHardware):
           payload = response.read().decode("utf-8", "ignore")
         self.atu100_connected = True
         self.atu100_active_host = host
+        self.atu100_last_error = None
         try:
           return json.loads(payload)
         except Exception:
           return payload
-      except Exception:
+      except Exception as e:
+        # Keep the most recent failure visible in the status label; a proxy
+        # environment variable, dead mDNS or a changed DHCP address all end
+        # up here while ping and a browser still work.
+        self.atu100_last_error = "%s: %s" % (type(e).__name__, e)
         continue
 
     self.atu100_connected = False
@@ -851,6 +857,11 @@ class Hardware(BaseHardware):
     if self.atu100_block_reason:
       return " ATU: %s " % self.atu100_block_reason, red
     if not self.atu100_connected:
+      err = getattr(self, 'atu100_last_error', None)
+      if err:
+        if len(err) > 34:
+          err = err[0:33] + '…'
+        return " ATU: offline (%s) " % err, normal
       return " ATU: --- ", normal
     st = self.atu100_status
     if not isinstance(st, dict):
@@ -1156,8 +1167,11 @@ class Hardware(BaseHardware):
       self._ScheduleAtu100Tune(band)
 
   def check_tx_inhibit(self):
-    # Task 2 continued: The amplifier band should match the selected band before allowing transmit.
-    if self.amp_band == self.current_band:
+    # The amplifier band guard protects the XPA125B only while it is online:
+    # with the amp out of the chain (or its feed down) there is nothing to
+    # protect, and inhibiting would block all transmit. When the amp
+    # reconnects and reports a mismatched band, the guard re-arms.
+    if not self.xpa125b_connected or self.amp_band == self.current_band:
       self.application.tx_inhibit = False
     else:
       self.application.tx_inhibit = True
