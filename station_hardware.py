@@ -302,16 +302,16 @@ class Hardware(BaseHardware):
     self.atu100_tune_active = False
     self.atu100_keyed = False
     self.atu100_saved_power = None
+    # --- ATU-100 tuning behaviour (hosts live under hosts.atu100) ---
     # Key a tuning carrier from quisk after arming the ATU. Without RF the
     # ATU-100 tune() fails instantly and atu_reset() zeroes the network,
-    # which looks like "TUNE then RESET" on the display.
-    self.atu100_auto_key = bool(_yaml_profile.get("atu100_auto_key", True))
-    # TX drive multiplier (percent of normal) while the tune carrier is up.
-    # The HL2 forward-power coupler needs roughly >= 0.05 W for quisk's
-    # built-in SWR readout to display (fwd >= 0.05 in quisk_widgets), and
-    # 20% of a small per-band drive lands below it. 50% keeps the readout
-    # alive while still being gentle.
-    self.atu100_tune_power = int(_yaml_profile.get("atu100_tune_power", 50))
+    # which looks like "TUNE then RESET" on the display. The HL2 coupler
+    # needs >= ~0.05 W for quisk's built-in SWR readout (fwd >= 0.05 in
+    # quisk_widgets), so tune_power is a percent of normal drive and the
+    # default of 50% keeps the readout alive while staying gentle.
+    _atu_cfg = _yaml_profile.get("atu100", {})
+    self.atu100_auto_key = bool(_atu_cfg.get("auto_key", True))
+    self.atu100_tune_power = int(_atu_cfg.get("tune_power", 50))
     
     self.client = mqtt.Client()
     if self.mqtt_user and self.mqtt_pass:

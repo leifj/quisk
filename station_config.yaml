@@ -82,15 +82,14 @@ profiles:
         short_press_ms: 400
         long_press_ms:  1000
 
-    # Key a tuning carrier from quisk after arming the ATU on band change
-    # (true = quisk briefly keys PTT so the ATU has RF to tune on; the ATU-100
-    # fails the tune and resets its network when there is no carrier).
-    # atu100_auto_key: true
-
-    # TX drive in percent of normal while the tune carrier is up. Must keep
-    # the forward power above ~0.05 W or quisk's built-in SWR readout
-    # shows "SWR ---" instead of tracking the tune.
-    # atu100_tune_power: 50
+    # ATU-100 WiFi tuner behaviour (hosts are under hosts.atu100):
+    # auto_key   - quisk keys a tuning carrier on band change; without RF the
+    #              ATU fails the tune and resets its network ("TUNE then RESET")
+    # tune_power - TX drive in percent of normal while the carrier is up; must
+    #              stay above ~0.05 W forward or quisk's built-in SWR shows ---
+    atu100:
+      auto_key:   true
+      tune_power: 50
 
     # ATR-1000 memory slot per band, keyed by switchctl antenna pin.
     # Outer key = pin number (int); inner key = Quisk band string; value = memory ID 1-255.
