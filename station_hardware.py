@@ -307,7 +307,11 @@ class Hardware(BaseHardware):
     # which looks like "TUNE then RESET" on the display.
     self.atu100_auto_key = bool(_yaml_profile.get("atu100_auto_key", True))
     # TX drive multiplier (percent of normal) while the tune carrier is up.
-    self.atu100_tune_power = int(_yaml_profile.get("atu100_tune_power", 20))
+    # The HL2 forward-power coupler needs roughly >= 0.05 W for quisk's
+    # built-in SWR readout to display (fwd >= 0.05 in quisk_widgets), and
+    # 20% of a small per-band drive lands below it. 50% keeps the readout
+    # alive while still being gentle.
+    self.atu100_tune_power = int(_yaml_profile.get("atu100_tune_power", 50))
     
     self.client = mqtt.Client()
     if self.mqtt_user and self.mqtt_pass:

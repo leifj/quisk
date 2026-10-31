@@ -87,8 +87,10 @@ profiles:
     # fails the tune and resets its network when there is no carrier).
     # atu100_auto_key: true
 
-    # TX drive in percent of normal while the tune carrier is up.
-    # atu100_tune_power: 20
+    # TX drive in percent of normal while the tune carrier is up. Must keep
+    # the forward power above ~0.05 W or quisk's built-in SWR readout
+    # shows "SWR ---" instead of tracking the tune.
+    # atu100_tune_power: 50
 
     # ATR-1000 memory slot per band, keyed by switchctl antenna pin.
     # Outer key = pin number (int); inner key = Quisk band string; value = memory ID 1-255.
