@@ -739,6 +739,8 @@ class Hardware(BaseHardware):
       except Exception as e:
         print("ATU-100: mode switch to %s failed: %s" % (mode, e))
       box['now'] = getattr(app, 'mode', None)
+      if box['now'] != mode:
+        print("ATU-100: mode switch to %s did not take (mode is %r)" % (mode, box['now']))
       done.set()
 
     wx.CallAfter(_apply)
@@ -821,9 +823,12 @@ class Hardware(BaseHardware):
           self.atu100_saved_power = saved
         # PTT alone generates no carrier in SSB/DGT modes (suppressed
         # carrier): switch to CW so key-down produces a constant carrier,
-        # the same pattern as the quisk Spot button.
-        saved_mode = self._Atu100SetMode('CW')
-        if saved_mode and saved_mode.get('now') == 'CW':
+        # the same pattern as the quisk Spot button. The mode buttons are
+        # CWL/CWU; there is no plain 'CW' mode in quisk.
+        saved_mode = self._Atu100SetMode('CWL')
+        if not (saved_mode and str(saved_mode.get('now', '')).startswith('CW')):
+          saved_mode = self._Atu100SetMode('CWU')
+        if saved_mode and str(saved_mode.get('now', '')).startswith('CW'):
           self.atu100_saved_mode = saved_mode['prior']
           self.atu100_mode_switched = True
           time.sleep(0.5)      # mode/filter switch settle
