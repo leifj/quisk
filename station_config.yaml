@@ -93,7 +93,8 @@ profiles:
       # Key the tune carrier even while the amp-band TX inhibit is set
       # (XPA125B offline or band not confirmed). The guard is lifted only
       # for the duration of the low-power tune carrier. Use with care.
-      # ignore_inhibit: false
+      # This station currently runs without the amp inline, so it is on.
+      ignore_inhibit: true
 
     # ATR-1000 memory slot per band, keyed by switchctl antenna pin.
     # Outer key = pin number (int); inner key = Quisk band string; value = memory ID 1-255.
