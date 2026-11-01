@@ -99,20 +99,29 @@ profiles:
     atu100:
       auto_key:   true
       tune_power: 50
-      # Adaptive tune cycle: the carrier is held until the measured SWR
-      # stays at or below tune_target_swr for tune_settle consecutive
-      # readings (esp32swr meter primary, the ATU's own reading as
-      # fallback), never longer than tune_max_time seconds. Raise
-      # tune_max_time for bands where the tuner needs long cycles.
+      # Adaptive tune cycle: the carrier is held until the ATU finishes its
+      # own cycle (its TUNE indicator drops), bounded by tune_max_time
+      # seconds. The ATU's achieved SWR (its own bridge reading) is logged
+      # afterwards; tune_target_swr classifies the result. Note the
+      # esp32swr meter is on the antenna side of the ATU's network and
+      # reads the raw antenna SWR, which does not change during the tune -
+      # it cannot judge the ATU's input match.
       # tune_max_time:    25
       # tune_target_swr:  1.3
-      # tune_settle:      2
       # Start the cycle with an ATU reset (clean network state).
       reset_first: true
       # Relax the esp32swr protection thresholds during the cycle: a bad
       # initial match would otherwise trip the meter's relay and cut the
       # RF from the tune (seen on 15 m). Thresholds are restored after.
       relax_meter: true
+      # SWR-follow bypass: when the raw antenna SWR (esp32swr) is already
+      # good but the ATU's own bridge reads a poor match, the engaged
+      # network is degrading the chain - power the ATU off (true
+      # straight-through bypass) so the rig sees the raw match. Re-armed
+      # on band change.
+      swr_follow_bypass: true
+      # bypass_bridge_swr: 2.0   # ATU bridge reading that counts as "poor"
+      # bypass_raw_swr:    1.5   # raw antenna SWR that counts as "already good"
       # Key the tune carrier even while the amp-band TX inhibit is set
       # (XPA125B offline or band not confirmed). The guard is lifted only
       # for the duration of the low-power tune carrier. Use with care.

@@ -364,13 +364,21 @@ class Hardware(BaseHardware):
     # consecutive good readings required before declaring convergence.
     self.atu100_tune_max_time = int(_atu_cfg.get("tune_max_time", 25))
     self.atu100_tune_target_swr = float(_atu_cfg.get("tune_target_swr", 1.3))
-    self.atu100_tune_settle = int(_atu_cfg.get("tune_settle", 2))
     # Start every tune cycle with an ATU reset (clean network state) and
     # relax the esp32swr protection thresholds for the duration of the
     # carrier, so a bad initial match cannot trip the meter's relay and
     # starve the tune of RF. Both restored/normal after the cycle.
     self.atu100_reset_first = bool(_atu_cfg.get("reset_first", True))
     self.atu100_relax_meter = bool(_atu_cfg.get("relax_meter", True))
+    # The esp32swr meter sits on the ANTENNA side of the ATU's network and
+    # reads the raw antenna SWR, which does not change while the ATU tunes.
+    # When the raw SWR is already good but the ATU's own bridge reports a
+    # poor match, the engaged network is degrading the chain: bypass the
+    # ATU by removing its power (its off state is a true straight-through).
+    self.atu100_swr_follow_bypass = bool(_atu_cfg.get("swr_follow_bypass", True))
+    self.atu100_bypass_bridge_swr = float(_atu_cfg.get("bypass_bridge_swr", 2.0))
+    self.atu100_bypass_raw_swr = float(_atu_cfg.get("bypass_raw_swr", 1.5))
+    self.atu100_auto_bypassed = False
     self.atu100_block_reason = None
     self.atu100_inhibit_bypassed = False
     self.atu100_last_error = None
@@ -441,6 +449,11 @@ class Hardware(BaseHardware):
       if 'esptuner' in self.station_equipment:
         try:
           self.PollEsptunerStatus()
+        except Exception:
+          pass
+      if self.atu100_swr_follow_bypass:
+        try:
+          self._Atu100SwrFollowBypass()
         except Exception:
           pass
       time.sleep(self.control_poll_interval)
@@ -899,6 +912,7 @@ class Hardware(BaseHardware):
     if self.atu100_tune_active:
       return True
     self.atu100_tune_active = True
+    self.atu100_auto_bypassed = False   # a tune cycle re-engages the ATU
     self.atu100_block_reason = None
     converged = False
     saved_limits = None
@@ -945,45 +959,37 @@ class Hardware(BaseHardware):
       if self._Atu100Request("/api/tune") is None:
         return False
 
-      # Adaptive hold: poll both the ATU and the SWR meter. Converged when
-      # the SWR stays at or below the target for tune_settle consecutive
-      # readings. The ATU leaving its TUNE state without convergence ends
-      # the cycle early (it reset or gave up); the hard cap is tune_max_time.
+      # Hold: keep the carrier until the ATU finishes its own tuning cycle
+      # (its TUNE indicator drops), bounded by tune_max_time. The esp32swr
+      # meter sits on the ANTENNA side of the ATU's network and reads the
+      # raw antenna SWR, which does not change while the ATU tunes - so it
+      # cannot judge the ATU's input match and is not used here.
       started = time.monotonic()
       armed_seen = False
-      good = 0
       while time.monotonic() - started < self.atu100_tune_max_time:
         if not self.atu100_keyed:
           break                     # carrier released externally (Stop)
         time.sleep(0.5)
         self.PollAtu100Status()
-        if 'esp32swr' in self.station_equipment:
-          try:
-            self.PollEsp32SwrStatus()
-          except Exception:
-            pass
         st = self.atu100_status if isinstance(self.atu100_status, dict) else {}
         if str(st.get("power", "")).lower() != "true":
           break
-        if str(st.get("tuning", "")).lower() == "true":
+        tuning = str(st.get("tuning", "")).lower() == "true"
+        if tuning:
           armed_seen = True
-          good = 0
-        vswr_now = self._Atu100SwrNow()
-        if vswr_now is not None and vswr_now <= self.atu100_tune_target_swr:
-          good += 1
-          if good >= self.atu100_tune_settle:
-            converged = True
-            break
-        else:
-          good = 0
-        if armed_seen and str(st.get("tuning", "")).lower() != "true" \
-            and time.monotonic() - started > 3.0:
-          break                     # ATU finished its cycle, SWR not met
+        if armed_seen and not tuning:
+          break                     # the ATU finished its cycle
+      # Give the ATU's LCD a moment to publish the achieved SWR, then log it.
+      time.sleep(0.8)
+      self.PollAtu100Status()
+      st = self.atu100_status if isinstance(self.atu100_status, dict) else {}
+      final_swr = st.get("swr", "?")
       elapsed = time.monotonic() - started
-      if converged:
-        print("ATU-100: tune converged in %.1f s" % elapsed)
-      else:
-        print("ATU-100: tune ended without convergence after %.1f s" % elapsed)
+      try:
+        verdict = "converged" if float(final_swr) <= self.atu100_tune_target_swr else "NOT converged"
+      except Exception:
+        verdict = "no SWR reading"
+      print("ATU-100: tune cycle ended after %.1f s, ATU reports SWR %s (%s)" % (elapsed, final_swr, verdict))
     finally:
       if saved_limits:
         self._Esp32SwrRestoreLimits(saved_limits)
@@ -1045,6 +1051,10 @@ class Hardware(BaseHardware):
     st = self.atu100_status
     if not isinstance(st, dict):
       return " ATU: ... ", yellow
+    if str(st.get("power", "")).lower() != "true":
+      if self.atu100_auto_bypassed:
+        return " ATU: bypassed (raw SWR ok) ", green
+      return " ATU: bypassed ", normal
 
     def _val(key):
       value = st.get(key)
@@ -1329,6 +1339,7 @@ class Hardware(BaseHardware):
   def ChangeBand(self, band):
     BaseHardware.ChangeBand(self, band)
     self.current_band = band
+    self.atu100_auto_bypassed = False   # re-arm the SWR-follow bypass
     self._UpdateAmpLabel()
     self.send_band(band)
     self.check_tx_inhibit()
@@ -1549,6 +1560,37 @@ class Hardware(BaseHardware):
   def _UpdateEsptunerLabel(self):
     label, color = self._FormatEsptunerLabel()
     self._ApplyEsptunerLabel(label, color)
+
+  def _Atu100SwrFollowBypass(self):
+    """Bypass the ATU when it is degrading an already-good match.
+
+    The esp32swr meter sits on the antenna side of the ATU's network and
+    reads the raw antenna SWR. If that reading is good while the ATU's own
+    bridge reports a poor match, the engaged network is the problem: power
+    the ATU down (its off state is a true straight-through bypass) so the
+    rig sees the raw match. Re-armed on band change or by a tune cycle.
+    """
+    if self.atu100_auto_bypassed or self.atu100_tune_active:
+      return
+    st = self.atu100_status if isinstance(self.atu100_status, dict) else {}
+    meter = self.esp32swr_status if isinstance(self.esp32swr_status, dict) else {}
+    if str(st.get("power", "")).lower() != "true":
+      return                      # already bypassed
+    if str(meter.get("valid", "")).lower() != "true":
+      return                      # need a live raw reading during TX
+    try:
+      bridge = float(st.get("swr", "0"))
+      raw = float(meter.get("vswr", "0"))
+      fwd = float(meter.get("fwd", "0"))
+    except Exception:
+      return
+    if fwd < 0.5:
+      return                      # not enough RF to judge
+    if bridge > self.atu100_bypass_bridge_swr and raw <= self.atu100_bypass_raw_swr:
+      print("ATU-100: bridge SWR %.2f with raw antenna SWR %.2f - bypassing the ATU" % (bridge, raw))
+      self._Atu100Request("/api/off")
+      self.atu100_auto_bypassed = True
+      wx.CallAfter(self._UpdateAtu100Label)
 
   def check_tx_inhibit(self):
     # The amplifier band guard protects the XPA125B only while it is online:
