@@ -338,6 +338,13 @@ class Hardware(BaseHardware):
     # (XPA125B offline or band not yet confirmed). The guard is cleared only
     # for the duration of the tune carrier and restored afterwards.
     self.atu100_ignore_inhibit = bool(_atu_cfg.get("ignore_inhibit", False))
+    # Adaptive tune cycle: keep the carrier up until the measured SWR
+    # converges (esp32swr meter primary, the ATU's own reading as
+    # fallback), bounded by tune_max_time. tune_settle is the number of
+    # consecutive good readings required before declaring convergence.
+    self.atu100_tune_max_time = int(_atu_cfg.get("tune_max_time", 25))
+    self.atu100_tune_target_swr = float(_atu_cfg.get("tune_target_swr", 1.3))
+    self.atu100_tune_settle = int(_atu_cfg.get("tune_settle", 2))
     self.atu100_block_reason = None
     self.atu100_inhibit_bypassed = False
     self.atu100_last_error = None
@@ -829,17 +836,40 @@ class Hardware(BaseHardware):
     wx.CallAfter(_apply)
     done.wait(2.0)
 
+  def _Atu100SwrNow(self):
+    """Current SWR as seen by the station: the esp32swr meter when it is
+    active and valid, otherwise the ATU's own post-tune reading."""
+    st = self.esp32swr_status
+    if 'esp32swr' in self.station_equipment and isinstance(st, dict) \
+        and str(st.get("valid", "")).lower() == "true":
+      try:
+        value = float(st.get("vswr", "1"))
+        if value > 0:
+          return value
+      except Exception:
+        pass
+    st = self.atu100_status if isinstance(self.atu100_status, dict) else {}
+    try:
+      value = float(st.get("swr", "1"))
+      if value > 0:
+        return value
+    except Exception:
+      pass
+    return None
+
   def Atu100Tune(self, key_carrier=None):
     """Arm the ATU tune and key a tuning carrier until the cycle finishes.
 
     The ATU-100 tunes only with RF on the input: the stock firmware fails
     the tune and runs atu_reset() when there is no carrier, so the carrier
-    is keyed BEFORE the TUNE pulse lands.
+    is keyed BEFORE the TUNE pulse lands. The carrier is held until the
+    measured SWR converges (adaptive), never longer than tune_max_time.
     """
     if self.atu100_tune_active:
       return True
     self.atu100_tune_active = True
     self.atu100_block_reason = None
+    converged = False
     try:
       if not self._Atu100EnsurePower():
         self.atu100_block_reason = "ATU unreachable"
@@ -870,15 +900,46 @@ class Hardware(BaseHardware):
         time.sleep(0.3)        # carrier onset before the ATU samples RF
       if self._Atu100Request("/api/tune") is None:
         return False
-      deadline = time.monotonic() + 12.0
-      while time.monotonic() < deadline:
+
+      # Adaptive hold: poll both the ATU and the SWR meter. Converged when
+      # the SWR stays at or below the target for tune_settle consecutive
+      # readings. The ATU leaving its TUNE state without convergence ends
+      # the cycle early (it reset or gave up); the hard cap is tune_max_time.
+      started = time.monotonic()
+      armed_seen = False
+      good = 0
+      while time.monotonic() - started < self.atu100_tune_max_time:
+        if not self.atu100_keyed:
+          break                     # carrier released externally (Stop)
         time.sleep(0.5)
         self.PollAtu100Status()
+        if 'esp32swr' in self.station_equipment:
+          try:
+            self.PollEsp32SwrStatus()
+          except Exception:
+            pass
         st = self.atu100_status if isinstance(self.atu100_status, dict) else {}
         if str(st.get("power", "")).lower() != "true":
           break
-        if str(st.get("tuning", "")).lower() != "true":
-          break
+        if str(st.get("tuning", "")).lower() == "true":
+          armed_seen = True
+          good = 0
+        vswr_now = self._Atu100SwrNow()
+        if vswr_now is not None and vswr_now <= self.atu100_tune_target_swr:
+          good += 1
+          if good >= self.atu100_tune_settle:
+            converged = True
+            break
+        else:
+          good = 0
+        if armed_seen and str(st.get("tuning", "")).lower() != "true" \
+            and time.monotonic() - started > 3.0:
+          break                     # ATU finished its cycle, SWR not met
+      elapsed = time.monotonic() - started
+      if converged:
+        print("ATU-100: tune converged in %.1f s" % elapsed)
+      else:
+        print("ATU-100: tune ended without convergence after %.1f s" % elapsed)
     finally:
       self._Atu100BypassInhibit(False)
       self._Atu100ReleaseCarrier()

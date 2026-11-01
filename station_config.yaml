@@ -94,6 +94,14 @@ profiles:
     atu100:
       auto_key:   true
       tune_power: 50
+      # Adaptive tune cycle: the carrier is held until the measured SWR
+      # stays at or below tune_target_swr for tune_settle consecutive
+      # readings (esp32swr meter primary, the ATU's own reading as
+      # fallback), never longer than tune_max_time seconds. Raise
+      # tune_max_time for bands where the tuner needs long cycles.
+      # tune_max_time:    25
+      # tune_target_swr:  1.3
+      # tune_settle:      2
       # Key the tune carrier even while the amp-band TX inhibit is set
       # (XPA125B offline or band not confirmed). The guard is lifted only
       # for the duration of the low-power tune carrier. Use with care.
