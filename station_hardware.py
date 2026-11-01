@@ -345,6 +345,12 @@ class Hardware(BaseHardware):
     self.atu100_tune_max_time = int(_atu_cfg.get("tune_max_time", 25))
     self.atu100_tune_target_swr = float(_atu_cfg.get("tune_target_swr", 1.3))
     self.atu100_tune_settle = int(_atu_cfg.get("tune_settle", 2))
+    # Start every tune cycle with an ATU reset (clean network state) and
+    # relax the esp32swr protection thresholds for the duration of the
+    # carrier, so a bad initial match cannot trip the meter's relay and
+    # starve the tune of RF. Both restored/normal after the cycle.
+    self.atu100_reset_first = bool(_atu_cfg.get("reset_first", True))
+    self.atu100_relax_meter = bool(_atu_cfg.get("relax_meter", True))
     self.atu100_block_reason = None
     self.atu100_inhibit_bypassed = False
     self.atu100_last_error = None
@@ -870,6 +876,7 @@ class Hardware(BaseHardware):
     self.atu100_tune_active = True
     self.atu100_block_reason = None
     converged = False
+    saved_limits = None
     try:
       if not self._Atu100EnsurePower():
         self.atu100_block_reason = "ATU unreachable"
@@ -877,6 +884,18 @@ class Hardware(BaseHardware):
         return False
       if key_carrier is None:
         key_carrier = self.atu100_auto_key
+      if key_carrier and self.atu100_relax_meter \
+          and 'esp32swr' in self.station_equipment:
+        # During a reset/tune the presented SWR is intentionally bad; relax
+        # the meter's relay thresholds so it cannot cut the RF mid-cycle.
+        saved_limits = self._Esp32SwrRelaxLimits()
+        if saved_limits:
+          print("ATU-100: esp32swr protection relaxed for the tune cycle")
+      if key_carrier and self.atu100_reset_first:
+        # Clear the tuner network before any RF: the cycle then starts from
+        # a known state instead of whatever the previous band left behind.
+        if self._Atu100Request("/api/reset") is not None:
+          time.sleep(0.5)
       if key_carrier and not self._Atu100GetAppPtt():
         inhibited = bool(getattr(self.application, 'tx_inhibit', False))
         if inhibited and self.atu100_ignore_inhibit:
@@ -941,6 +960,8 @@ class Hardware(BaseHardware):
       else:
         print("ATU-100: tune ended without convergence after %.1f s" % elapsed)
     finally:
+      if saved_limits:
+        self._Esp32SwrRestoreLimits(saved_limits)
       self._Atu100BypassInhibit(False)
       self._Atu100ReleaseCarrier()
       self.atu100_tune_active = False
@@ -1305,7 +1326,7 @@ class Hardware(BaseHardware):
   # atu100-style path that also surfaces the meter state independently of
   # the broker.
 
-  def _Esp32SwrRequest(self, endpoint, params=None):
+  def _Esp32SwrRequest(self, endpoint, params=None, body=None):
     hosts = []
     if self.esp32swr_active_host:
       hosts.append(self.esp32swr_active_host)
@@ -1319,8 +1340,11 @@ class Hardware(BaseHardware):
       url = "http://%s:%d%s" % (host, self.esp32swr_port, endpoint)
       if params:
         url += "?" + urllib.parse.urlencode(params)
+      data = body.encode("utf-8") if body else None
+      headers = {"Content-Type": "application/json"} if body else {}
       try:
-        with urllib.request.urlopen(url, timeout=self.esp32swr_timeout) as response:
+        with urllib.request.urlopen(urllib.request.Request(url, data=data, headers=headers),
+                                    timeout=self.esp32swr_timeout) as response:
           payload = response.read().decode("utf-8", "ignore")
         self.esp32swr_connected = True
         self.esp32swr_active_host = host
@@ -1335,6 +1359,32 @@ class Hardware(BaseHardware):
 
     self.esp32swr_connected = False
     return None
+
+  def _Esp32SwrRelaxLimits(self):
+    """Raise the SWR meter's protection thresholds for the duration of a
+    tune cycle. During a reset/tune the presented SWR is intentionally bad;
+    without this the meter's protective relay cuts the RF and the tune
+    starves (seen on 15 m). Returns the saved settings for restoration."""
+    saved = {}
+    settings = self._Esp32SwrRequest("/api/settings")
+    if isinstance(settings, dict):
+      for key in ("rev_max", "vswr_max"):
+        try:
+          saved[key] = float(settings.get(key))
+        except Exception:
+          pass
+    self._Esp32SwrRequest("/api/settings", body=json.dumps({"rev_max": 99, "vswr_max": 99}))
+    return saved
+
+  def _Esp32SwrRestoreLimits(self, saved):
+    if not saved:
+      return
+    body = {}
+    for key in ("rev_max", "vswr_max"):
+      if key in saved:
+        body[key] = saved[key]
+    if body:
+      self._Esp32SwrRequest("/api/settings", body=json.dumps(body))
 
   def GetEsp32SwrConnected(self):
     return self.esp32swr_connected
