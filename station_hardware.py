@@ -69,6 +69,12 @@ station_host_map = {
     # WiFi link; same headroom as the atu100.
     "timeout": 2.0,
   },
+  "esptuner": {
+    "host": "esptuner.local",
+    "port": 80,
+    # WiFi link; same headroom as the other controllers.
+    "timeout": 2.0,
+  },
 }
 
 # ATR-1000 memory slot per band, indexed by antenna switch pin.
@@ -118,6 +124,9 @@ atu100_timeout = float(station_host_map["atu100"]["timeout"])
 esp32swr_host = station_host_map["esp32swr"]["host"]
 esp32swr_port = int(station_host_map["esp32swr"]["port"])
 esp32swr_timeout = float(station_host_map["esp32swr"]["timeout"])
+esptuner_host = station_host_map["esptuner"]["host"]
+esptuner_port = int(station_host_map["esptuner"]["port"])
+esptuner_timeout = float(station_host_map["esptuner"]["timeout"])
 xpa125b_relay_button_config = (
   {"label": "Power", "relay_index": 3, "short_press_ms": 2000, "long_press_ms": 1000, "power_button": True},
   {"label": "Relay 1", "relay_index": 0, "short_press_ms": 400, "long_press_ms": 1000},
@@ -140,7 +149,7 @@ xpa125b_relay_button_config = (
 # built-in defaults below are used.
 
 _station_equipment_profiles_builtin = {
-  "default": frozenset({"mqtt", "xpa125b", "atr1000", "lz1aq", "switchctl", "esp32swr", "atu100"}),
+  "default": frozenset({"mqtt", "xpa125b", "atr1000", "lz1aq", "switchctl", "esp32swr", "atu100", "esptuner"}),
 }
 
 def _load_station_config():
@@ -249,6 +258,17 @@ class Hardware(BaseHardware):
     self.esp32swr_port = int(_espswr_cfg.get("port", esp32swr_port))
     self.esp32swr_timeout = float(_espswr_cfg.get("timeout", esp32swr_timeout))
     self.esp32swr_active_host = self.esp32swr_host
+
+    _etn_cfg = _hosts.get("esptuner", {})
+    self.esptuner_host = _etn_cfg.get("host", esptuner_host)
+    _etn_fb = _etn_cfg.get("fallback_hosts", ())
+    self.esptuner_fallback_hosts = tuple(_etn_fb) if isinstance(_etn_fb, (list, tuple)) else ()
+    self.esptuner_port = int(_etn_cfg.get("port", esptuner_port))
+    self.esptuner_timeout = float(_etn_cfg.get("timeout", esptuner_timeout))
+    self.esptuner_active_host = self.esptuner_host
+    self.esptuner_connected = False
+    self.esptuner_status = None
+    self.esptuner_last_error = None
 
     # --- XPA125B relay button config ---
     _relay_cfg = _yaml_profile.get("xpa125b_relays", None)
@@ -369,7 +389,7 @@ class Hardware(BaseHardware):
       self.thread.daemon = True
       self.thread.start()
 
-    if 'lz1aq' in self.station_equipment or 'switchctl' in self.station_equipment or 'atu100' in self.station_equipment or 'esp32swr' in self.station_equipment:
+    if 'lz1aq' in self.station_equipment or 'switchctl' in self.station_equipment or 'atu100' in self.station_equipment or 'esp32swr' in self.station_equipment or 'esptuner' in self.station_equipment:
       self.control_thread = threading.Thread(target=self.control_loop)
       self.control_thread.daemon = True
       self.control_thread.start()
@@ -416,6 +436,11 @@ class Hardware(BaseHardware):
       if 'esp32swr' in self.station_equipment:
         try:
           self.PollEsp32SwrStatus()
+        except Exception:
+          pass
+      if 'esptuner' in self.station_equipment:
+        try:
+          self.PollEsptunerStatus()
         except Exception:
           pass
       time.sleep(self.control_poll_interval)
@@ -1413,6 +1438,117 @@ class Hardware(BaseHardware):
         wx.CallAfter(self._UpdateSwrLabel)
       return True
     return False
+
+  # --- esptuner (SG-231 Smartuner controller) --------------------------------
+  # The SGC SG-231 tunes on RF by itself: no tune-trigger line exists. The
+  # esptuner board drives the SmartLock control lines:
+  #   power  - coupler +12 VDC (off = bypass/standby, broadband receive)
+  #   hold   - J1-5 white "Hold Settings" (Tune Lock): the coupler will not
+  #            run the tuning algorithm while asserted
+  #   reset  - J1-4 blue "Reset": reset to bypass/standby until next RF
+  #   tuned  - J1-3 green remote tuned indicator (reads the match state)
+  # Tuning needs 3-100 W of RF; a new frequency takes < 2-4 s, a remembered
+  # one ~10-20 ms.
+
+  def _EsptunerRequest(self, endpoint, params=None):
+    hosts = []
+    if self.esptuner_active_host:
+      hosts.append(self.esptuner_active_host)
+    if self.esptuner_host and self.esptuner_host not in hosts:
+      hosts.append(self.esptuner_host)
+    for host in self.esptuner_fallback_hosts:
+      if host and host not in hosts:
+        hosts.append(host)
+
+    for host in hosts:
+      url = "http://%s:%d%s" % (host, self.esptuner_port, endpoint)
+      if params:
+        url += "?" + urllib.parse.urlencode(params)
+      try:
+        with urllib.request.urlopen(url, timeout=self.esptuner_timeout) as response:
+          payload = response.read().decode("utf-8", "ignore")
+        self.esptuner_connected = True
+        self.esptuner_active_host = host
+        self.esptuner_last_error = None
+        try:
+          return json.loads(payload)
+        except Exception:
+          return payload
+      except Exception as e:
+        self.esptuner_last_error = "%s: %s" % (type(e).__name__, e)
+        continue
+
+    self.esptuner_connected = False
+    return None
+
+  def GetEsptunerConnected(self):
+    return self.esptuner_connected
+
+  def GetEsptunerStatus(self):
+    return self.esptuner_status
+
+  def GetEsptunerPower(self):
+    st = self.esptuner_status
+    if isinstance(st, dict):
+      return str(st.get("on", "")).lower() == "true"
+    return None
+
+  def PollEsptunerStatus(self):
+    response = self._EsptunerRequest("/api/is_tuned")
+    if isinstance(response, dict):
+      self.esptuner_status = response
+      wx.CallAfter(self._UpdateEsptunerLabel)
+      return True
+    return False
+
+  def EsptunerPower(self, enabled):
+    return self._EsptunerRequest("/api/on" if enabled else "/api/off") is not None
+
+  def EsptunerReset(self):
+    return self._EsptunerRequest("/api/reset") is not None
+
+  def EsptunerHold(self):
+    return self._EsptunerRequest("/api/hold") is not None
+
+  def _FormatEsptunerLabel(self):
+    normal = self.conf.color_freq_txt
+    green = wx.Colour(0, 200, 0)
+    yellow = wx.Colour(220, 200, 0)
+    if not self.esptuner_connected:
+      return " ETU: --- ", normal
+    st = self.esptuner_status
+    if not isinstance(st, dict):
+      return " ETU: ... ", yellow
+    on = str(st.get("on", "")).lower() == "true"
+    tuned = str(st.get("tuned", "")).lower() == "true"
+    hold = str(st.get("hold", "")).lower() == "true"
+    parts = []
+    if not on:
+      parts.append("Off")
+    elif tuned:
+      parts.append("Tuned")
+    else:
+      parts.append("Untuned")
+    if hold:
+      parts.append("Lock")
+    label = " ETU: " + "  ".join(parts) + " "
+    if not on:
+      color = normal
+    elif tuned:
+      color = green
+    else:
+      color = yellow
+    return label, color
+
+  def _ApplyEsptunerLabel(self, label, color):
+    if hasattr(self.application, 'esptuner_status'):
+      self.application.esptuner_status.SetLabel(label)
+      self.application.esptuner_status.TextCtrl.SetForegroundColour(color)
+      self.application.esptuner_status.TextCtrl.Refresh()
+
+  def _UpdateEsptunerLabel(self):
+    label, color = self._FormatEsptunerLabel()
+    self._ApplyEsptunerLabel(label, color)
 
   def check_tx_inhibit(self):
     # The amplifier band guard protects the XPA125B only while it is online:

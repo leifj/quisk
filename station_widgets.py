@@ -33,12 +33,13 @@ class BottomWidgets:
 
   def _CreateStatusWidgets(self):
     eq = frozenset(getattr(self.hardware, 'station_equipment',
-                           {'mqtt', 'xpa125b', 'atr1000', 'lz1aq', 'switchctl', 'atu100'}))
+                           {'mqtt', 'xpa125b', 'atr1000', 'lz1aq', 'switchctl', 'atu100', 'esptuner'}))
     has_xpa = 'xpa125b' in eq
     has_atr = 'atr1000' in eq
     has_lz1aq = 'lz1aq' in eq
     has_switchctl = 'switchctl' in eq
     has_atu = 'atu100' in eq
+    has_etn = 'esptuner' in eq
     height = self._StatusHeight()
     # Status text widgets are always created; hardware references them via self.application.X_status
     self.application.swr_status = QuiskText(self.frame, ' SWR 1.000  F 0.000  R 0.000 ', height, 0, False)
@@ -49,6 +50,8 @@ class BottomWidgets:
     self.application.atr1000_status.SetLabel(' ATR: --- ')
     self.application.atu100_status = QuiskText(self.frame, ' ATU: SWR 9.99  999W  99.9uH  999pF  Auto ', height, 0, False)
     self.application.atu100_status.SetLabel(' ATU: --- ')
+    self.application.esptuner_status = QuiskText(self.frame, ' ETU: Tuned  On  Lock ', height, 0, False)
+    self.application.esptuner_status.SetLabel(' ETU: --- ')
     if has_switchctl:
       self.btnSwitchPower = self.application.QuiskCheckbutton(self.frame, self.OnBtnSwitchPower, text='SW Pwr')
       self.btnSwitchPower.SetValue(False, False)
@@ -88,7 +91,7 @@ class BottomWidgets:
         button.xpa_relay_index = relay_index
         button.xpa_power_button = bool(config.get("power_button", False))
         self.xpa_relay_buttons.append(button)
-    for ctrl_name in ('swr_status', 'amp_status', 'atr1000_status', 'atu100_status'):
+    for ctrl_name in ('swr_status', 'amp_status', 'atr1000_status', 'atu100_status', 'esptuner_status'):
       tc = getattr(self.application, ctrl_name, None)
       if tc:
         tc.TextCtrl.SetBackgroundColour(self.conf.color_freq)
@@ -137,6 +140,17 @@ class BottomWidgets:
         self.btnAtu100Tune.SetValue(False, False)
         self.gbs.Add(self.btnAtu100Tune, (atu_row, self.start_col + 0), (1, 2), flag=wx.EXPAND)
         self.gbs.Add(self.application.atu100_status, (atu_row, self.start_col + 2), (1, 6), flag=wx.EXPAND)
+      if has_etn:
+        etu_row = (atu_row if has_atu else (tuner_row if has_atr else relay_row)) + 1
+        rows_added += 1
+        self.btnEsptunerPower = self.application.QuiskCheckbutton(self.frame, self.OnBtnEsptunerPower, text='ETU Pwr')
+        self.btnEsptunerPower.SetValue(False, False)
+        self.btnEsptunerReset = self.application.QuiskPushbutton(self.frame, self.OnBtnEsptunerReset, 'ETU Reset')
+        self.btnEsptunerHold = self.application.QuiskPushbutton(self.frame, self.OnBtnEsptunerHold, 'ETU Lock')
+        self.gbs.Add(self.btnEsptunerPower, (etu_row, self.start_col + 0), (1, 2), flag=wx.EXPAND)
+        self.gbs.Add(self.btnEsptunerReset, (etu_row, self.start_col + 2), (1, 2), flag=wx.EXPAND)
+        self.gbs.Add(self.btnEsptunerHold, (etu_row, self.start_col + 4), (1, 2), flag=wx.EXPAND)
+        self.gbs.Add(self.application.esptuner_status, (etu_row, self.start_col + 6), (1, 6), flag=wx.EXPAND)
     else:
       col = self.start_col
       if has_switchctl:
@@ -178,12 +192,24 @@ class BottomWidgets:
         self.btnAtu100Tune.SetValue(False, False)
         self.gbs.Add(self.btnAtu100Tune, (atu_row, self.start_col + 0), flag=wx.EXPAND)
         self.gbs.Add(self.application.atu100_status, (atu_row, self.start_col + 1), (1, 5), flag=wx.EXPAND)
+      if has_etn:
+        etu_row = (atu_row if has_atu else (tuner_row if has_atr else relay_row)) + 1
+        rows_added += 1
+        self.btnEsptunerPower = self.application.QuiskCheckbutton(self.frame, self.OnBtnEsptunerPower, text='ETU Pwr')
+        self.btnEsptunerPower.SetValue(False, False)
+        self.btnEsptunerReset = self.application.QuiskPushbutton(self.frame, self.OnBtnEsptunerReset, 'ETU Rst')
+        self.btnEsptunerHold = self.application.QuiskPushbutton(self.frame, self.OnBtnEsptunerHold, 'ETU Lock')
+        self.gbs.Add(self.btnEsptunerPower, (etu_row, self.start_col + 0), flag=wx.EXPAND)
+        self.gbs.Add(self.btnEsptunerReset, (etu_row, self.start_col + 1), flag=wx.EXPAND)
+        self.gbs.Add(self.btnEsptunerHold, (etu_row, self.start_col + 2), flag=wx.EXPAND)
+        self.gbs.Add(self.application.esptuner_status, (etu_row, self.start_col + 3), (1, 3), flag=wx.EXPAND)
     self.num_rows_added += rows_added
     self._RefreshSwitchCtlControls()
     self._RefreshLz1aqControls()
     self._RefreshIoBoardToggle()
     self._RefreshXpaRelayControls()
     self._RefreshAtu100Controls()
+    self._RefreshEsptunerControls()
 
   def OnBtnSwitchPower(self, event):
     enabled = bool(self.btnSwitchPower.GetValue())
@@ -263,6 +289,19 @@ class BottomWidgets:
       if hasattr(self.hardware, 'Atu100Stop'):
         threading.Thread(target=self.hardware.Atu100Stop, daemon=True).start()
 
+  def OnBtnEsptunerPower(self, event):
+    enabled = bool(self.btnEsptunerPower.GetValue())
+    if hasattr(self.hardware, 'EsptunerPower'):
+      threading.Thread(target=self.hardware.EsptunerPower, args=(enabled,), daemon=True).start()
+
+  def OnBtnEsptunerReset(self, event):
+    if hasattr(self.hardware, 'EsptunerReset'):
+      threading.Thread(target=self.hardware.EsptunerReset, daemon=True).start()
+
+  def OnBtnEsptunerHold(self, event):
+    if hasattr(self.hardware, 'EsptunerHold'):
+      threading.Thread(target=self.hardware.EsptunerHold, daemon=True).start()
+
   def _RefreshAtu100Controls(self):
     if not hasattr(self, 'btnAtu100Tune'):
       return
@@ -271,6 +310,15 @@ class BottomWidgets:
       tuning = bool(self.hardware.GetAtu100Tuning())
     if self.btnAtu100Tune.GetValue() != tuning:
       self.btnAtu100Tune.SetValue(tuning, False)
+
+  def _RefreshEsptunerControls(self):
+    if not hasattr(self, 'btnEsptunerPower'):
+      return
+    on = None
+    if hasattr(self.hardware, 'GetEsptunerPower'):
+      on = self.hardware.GetEsptunerPower()
+    if on is not None and self.btnEsptunerPower.GetValue() != bool(on):
+      self.btnEsptunerPower.SetValue(bool(on), False)
 
   def OnChoiceAtr1000Mem(self, event):
     index = self.btnAtr1000MemSelect.GetSelection()
@@ -341,6 +389,7 @@ class BottomWidgets:
     self._RefreshIoBoardToggle()
     self._RefreshXpaRelayControls()
     self._RefreshAtu100Controls()
+    self._RefreshEsptunerControls()
 
   def __getattr__(self, name):
     return getattr(self.hermes_widgets, name)

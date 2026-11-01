@@ -9,7 +9,7 @@
 # A profile that omits a section inherits the module-level Python defaults.
 # Only the keys you want to override need to be present.
 #
-# Equipment keys: mqtt, xpa125b, atr1000, lz1aq, switchctl, esp32swr, atu100
+# Equipment keys: mqtt, xpa125b, atr1000, lz1aq, switchctl, esp32swr, atu100, esptuner
 
 profiles:
 
@@ -25,6 +25,7 @@ profiles:
       - switchctl
       - esp32swr
       - atu100
+      - esptuner
 
     hosts:
       mqtt:
@@ -36,6 +37,10 @@ profiles:
         timeout: 0.35
       esp32swr:
         host: esp32swr.local
+        port: 80
+        timeout: 2.0
+      esptuner:
+        host: esptuner.local
         port: 80
         timeout: 2.0
       switchctl:
