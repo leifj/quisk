@@ -108,6 +108,7 @@ profiles:
       # it cannot judge the ATU's input match.
       # tune_max_time:    25
       # tune_target_swr:  1.3
+      # tune_attempts:    3    # re-pulse reset+tune past the ATU's lazy 2:1 threshold
       # Start the cycle with an ATU reset (clean network state).
       reset_first: true
       # Relax the esp32swr protection thresholds during the cycle: a bad
